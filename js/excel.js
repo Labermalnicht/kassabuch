@@ -76,7 +76,8 @@ export async function buildWorkbook(biz, entries, year) {
   wb.created = new Date();
   wb.calcProperties.fullCalcOnLoad = true;
 
-  const tipsCol = !!biz.tips;
+  // Spalte Tips nur, wenn in diesem Jahr Tips gebucht wurden.
+  const tipsCol = info.entries.some((e) => e.kind === 'tips');
   const headers = ['LNr.', 'Lieferant', 'Dat.', 'Beschreibung', 'ReNr', 'Ausgaben', 'BAR', 'Kassa'];
   const widths = [8, 34, 12, 28, 17, 13, 13, 14];
   if (tipsCol) { headers.push('Tips'); widths.push(12); }

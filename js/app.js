@@ -1,6 +1,6 @@
 import * as db from './db.js';
 import { t, setLang, getLang } from './i18n.js';
-import { TEMPLATES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest } from './templates.js';
+import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest } from './templates.js';
 import {
   parseAmount, fmtMoney, fmtAmountInput, fmtDate, fmtDay, fmtMonth, shiftMonth,
   withBalances, currentBalance, todayISO, uid,
@@ -88,7 +88,7 @@ async function selectBiz(id) {
 function createBusiness({ name, template, startBalance, startDate }) {
   const tpl = TEMPLATES[template] || TEMPLATES.empty;
   return {
-    id: uid(), name, template, tips: tpl.tips, categories: [...tpl.categories],
+    id: uid(), name, template, categories: [...tpl.categories],
     employees: [], suppliers: {}, startBalance, startDate, created: Date.now(),
   };
 }
@@ -181,6 +181,9 @@ function viewHome() {
   if (firstNeg) {
     banners += banner('err', t('home.negative', { date: fmtDate(firstNeg.date), amount: fmtMoney(firstNeg.balance) }));
   }
+  if (!S.entries.length && !S.biz.startBalance) {
+    banners += banner('ok', t('home.startHint'), `<button class="btn small" data-act="nav:settings">${t('home.startHintBtn')}</button>`);
+  }
   const lastExport = S.settings.lastExport?.[S.biz.id];
   const lastChange = S.settings.lastChange?.[S.biz.id];
   if (S.entries.length && (!lastExport || (lastChange > lastExport && Date.now() - lastExport > 7 * 86400000))) {
@@ -193,7 +196,7 @@ function viewHome() {
     act('receipt-camera', 'camera', t('act.camera'), 'primary wide'),
     act('receipt-gallery', 'image', t('act.gallery')),
     act('new:takings', 'cash', t('act.takings')),
-    S.biz.tips ? act('new:tips', 'coins', t('act.tips')) : '',
+    act('new:tips', 'coins', t('act.tips')),
     act('salary', 'users', t('act.salary')),
     act('new:cashIn', 'in', t('act.cashIn')),
     act('new:cashOut', 'out', t('act.cashOut')),
@@ -230,7 +233,7 @@ ${banners}
   <div class="stats">
     <div><span class="muted">${t('home.in')}</span><b class="in">${fmtMoney(inSum)}</b></div>
     <div><span class="muted">${t('home.out')}</span><b class="out">${fmtMoney(outSum)}</b></div>
-    ${S.biz.tips ? `<div><span class="muted">${t('home.tips')}</span><b>${fmtMoney(tipsSum)}</b></div>` : ''}
+    ${tipsSum ? `<div><span class="muted">${t('home.tips')}</span><b>${fmtMoney(tipsSum)}</b></div>` : ''}
   </div>
 </section>
 ${list}`;
@@ -283,7 +286,7 @@ function viewSettings() {
 <section class="card pad">
   <h2 class="sec-title">${t('set.business')}</h2>
   <label class="field"><span class="lbl">${t('f.bizName')}</span><input type="text" data-set="name" value="${esc(b.name)}"></label>
-  <label class="switch"><input type="checkbox" data-set="tips" ${b.tips ? 'checked' : ''}><span>${t('set.tips')}</span></label>
+  <p class="hint">${t('set.branchInfo', { branch: t('tpl.' + b.template) })}</p>
   <div class="grid2">
     <label class="field"><span class="lbl">${t('f.startBalance')}</span><div class="money"><input type="text" inputmode="decimal" data-set="startBalance" value="${esc(fmtAmountInput(b.startBalance))}"><span>€</span></div></label>
     <label class="field"><span class="lbl">${t('f.startDate')}</span><input type="date" data-set="startDate" value="${esc(b.startDate || '')}"></label>
@@ -345,28 +348,20 @@ function viewSettings() {
 }
 
 function bizFormFields(prefix) {
-  const tpl = (id, label, desc) => `<label class="tpl"><input type="radio" name="${prefix}-tpl" value="${id}" ${id === 'gastro' ? 'checked' : ''}><span><b>${label}</b><small>${desc}</small></span></label>`;
+  const opts = BRANCHES.map((id) => `<option value="${id}">${esc(t('tpl.' + id))}</option>`).join('');
   return `
   <label class="field"><span class="lbl">${t('f.bizName')}</span><input type="text" id="${prefix}-name" autocomplete="organization"></label>
-  <fieldset class="field"><legend class="lbl">${t('f.template')}</legend>
-    <div class="tpls">${tpl('gastro', t('tpl.gastro'), t('tpl.gastroDesc'))}${tpl('beauty', t('tpl.beauty'), t('tpl.beautyDesc'))}${tpl('empty', t('tpl.empty'), t('tpl.emptyDesc'))}</div>
-  </fieldset>
-  <div class="grid2">
-    <label class="field"><span class="lbl">${t('f.startBalance')}</span><div class="money"><input type="text" inputmode="decimal" id="${prefix}-start" placeholder="0,00"><span>€</span></div></label>
-    <label class="field"><span class="lbl">${t('f.startDate')}</span><input type="date" id="${prefix}-date" value="${todayISO().slice(0, 8)}01"></label>
-  </div>
-  <p class="hint">${t('set.startHint')}</p>`;
+  <label class="field"><span class="lbl">${t('f.template')}</span><select id="${prefix}-tpl"><option value="" selected disabled>${esc(t('f.templatePick'))}</option>${opts}</select></label>
+  <p class="hint">${t('hint.branch')}</p>`;
 }
 
 function readBizForm(prefix) {
   const name = document.getElementById(`${prefix}-name`).value.trim();
-  const template = (document.querySelector(`input[name="${prefix}-tpl"]:checked`) || {}).value || 'empty';
-  const startRaw = document.getElementById(`${prefix}-start`).value;
-  const startBalance = startRaw.trim() ? parseAmount(startRaw) : 0;
-  const startDate = document.getElementById(`${prefix}-date`).value || todayISO();
+  const template = document.getElementById(`${prefix}-tpl`).value;
   if (!name) { showToast(t('err.bizName'), 'err'); return null; }
-  if (startBalance === null) { showToast(t('err.amountFormat'), 'err'); return null; }
-  return { name, template, startBalance, startDate };
+  if (!template) { showToast(t('err.branch'), 'err'); return null; }
+  // Anfangsbestand und Beginn lassen sich danach in den Einstellungen setzen.
+  return { name, template, startBalance: 0, startDate: `${todayISO().slice(0, 8)}01` };
 }
 
 function viewOnboarding() {
@@ -1122,8 +1117,7 @@ document.addEventListener('change', async (ev) => {
   }
   if (el.dataset.set && S.biz) {
     const key = el.dataset.set;
-    if (key === 'tips') S.biz.tips = el.checked;
-    else if (key === 'startBalance') {
+    if (key === 'startBalance') {
       const v = el.value.trim() ? parseAmount(el.value) : 0;
       if (v === null) { showToast(t('err.amountFormat'), 'err'); return; }
       S.biz.startBalance = v;

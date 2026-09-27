@@ -58,7 +58,10 @@ function schema(categories) {
   };
 }
 
-const BRANCH = { gastro: 'Gastronomie', beauty: 'Beauty-Salon', empty: 'Kleinbetrieb' };
+const BRANCH = {
+  gastro: 'Gastronomie', beauty: 'Friseur, Kosmetik oder Nagelstudio', retail: 'Einzelhandel', craft: 'Handwerk und Bau',
+  service: 'Dienstleistung und Büro', health: 'Gesundheit und Therapie', transport: 'Taxi und Transport', empty: 'Kleinbetrieb',
+};
 
 function userText(biz) {
   const known = [...new Set(Object.values(biz.suppliers || {}).map((s) => s.name))].slice(0, 80);
