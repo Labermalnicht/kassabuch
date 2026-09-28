@@ -7,6 +7,7 @@ import {
 } from './ledger.js';
 import { prepareImage, decodeForCrop, cropToBlob } from './image.js';
 import { detectReceipts } from './detect.js';
+import { scanRksv } from './rksv.js';
 import * as ocr from './ocr.js';
 import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js';
 
@@ -285,6 +286,13 @@ function viewExport() {
     <div><dt>${t('export.carry')}</dt><dd>${fmtMoney(info.carry)}</dd></div>
     <div><dt>${t('export.end')}</dt><dd>${fmtMoney(info.end)}</dd></div>
   </dl>
+  <div class="field"><span class="lbl">${t('export.autoLnr')}</span>
+    <div class="seg" role="radiogroup">
+      <button class="${S.biz.autoLnr !== false ? 'on' : ''}" data-act="lnr:1" aria-pressed="${S.biz.autoLnr !== false}">${t('yes')}</button>
+      <button class="${S.biz.autoLnr === false ? 'on' : ''}" data-act="lnr:0" aria-pressed="${S.biz.autoLnr === false}">${t('no')}</button>
+    </div>
+    <span class="hint">${t(S.biz.autoLnr === false ? 'export.autoLnrNo' : 'export.autoLnrYes')}</span>
+  </div>
   <button class="btn primary block" data-act="export-run" ${S.busy ? 'disabled' : ''}>${icon('download')}<span>${S.busy ? t('export.busy') : t('export.run')}</span></button>
   <p class="hint">${t('export.hint')}</p>
   ${lastExport ? `<p class="hint">${t('export.last', { date: new Date(lastExport).toLocaleString(getLang() === 'de' ? 'de-AT' : 'en-GB') })}</p>` : ''}
@@ -483,6 +491,7 @@ function ocrBox(o) {
   if (o.multi) parts.push(`<div class="ocr info">${icon('image')}<span>${esc(o.multi)}</span></div>`);
   if (o.note) parts.push(`<div class="ocr warn">${icon('alert')}<span>${esc(o.note)}</span></div>`);
   if (o.notReceipt) parts.push(`<div class="ocr warn">${icon('alert')}<span>${t('ocr.notReceipt')}</span></div>`);
+  if (o.rksv) parts.push(`<div class="ocr info">${icon('check')}<span>${t('ocr.rksv')}</span></div>`);
   if (o.payment === 'karte') parts.push(`<div class="ocr info">${icon('cash')}<span>${t('ocr.card')}</span></div>`);
   if (o.tip) parts.push(`<div class="ocr info">${icon('camera')}<span>${t('ocr.photoTip')}</span></div>`);
   return parts.join('');
@@ -669,7 +678,7 @@ async function processNext() {
   m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
   m.preview = file.preview;
   applyRecognition(m, file.recognized);
-  m.ocr = { status: 'claude', payment: file.recognized.payment, multi: file.multi };
+  m.ocr = { status: 'claude', payment: file.recognized.payment, multi: file.multi, rksv: file.recognized.rksv };
   renderModal();
 }
 
@@ -781,6 +790,8 @@ async function recognizePhoto(file, queuePos = '') {
   syncModal();
   m.preview = img.thumb;
   renderModal();
+  // RKSV-QR-Code parallel zur Texterkennung suchen.
+  const rksvP = scanRksv(img.src).catch((e) => { console.warn('RKSV-Code', e); return null; });
 
   let res = null;
   let note = '';
@@ -791,6 +802,12 @@ async function recognizePhoto(file, queuePos = '') {
       if (!list.length) {
         res = { source: 'claude', isReceipt: false, supplier: '', date: null, ref: '', amount: null, category: null, payment: 'unbekannt' };
       } else {
+        // RKSV-Code dem Beleg mit passendem Betrag zuordnen (bei nur einem Beleg immer diesem).
+        const q = await rksvP;
+        if (q) {
+          const target = list.length === 1 ? list[0] : list.find((r) => r.amount && Math.abs(r.amount - q.total) <= 1);
+          if (target) mergeRksv(target, q);
+        }
         res = list[0];
         if (list.length > 1) {
           // Weitere Belege auf demselben Foto: direkt danach je ein eigenes Formular, ohne neue Erkennung.
@@ -817,12 +834,37 @@ async function recognizePhoto(file, queuePos = '') {
       return;
     }
   }
+  if (res.source === 'offline') {
+    const q = await rksvP;
+    if (q) mergeRksv(res, q);
+  }
   if (!alive()) return;
   syncModal();
   applyRecognition(m, res);
   m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
-  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt, multi, tip: res.source === 'offline', known: res.known };
+  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt, multi, tip: res.source === 'offline' && !res.rksv, known: res.known, rksv: res.rksv };
   renderModal();
+}
+
+// Exakte Werte aus dem RKSV-Code übernehmen: Datum und Betrag immer, die Belegnummer nur ergänzend.
+function mergeRksv(res, q) {
+  if (!q || q.total <= 0) return false;
+  res.date = q.date;
+  res.amount = q.total;
+  res.isReceipt = true;
+  const qn = String(q.belegNr);
+  if (!res.ref) {
+    res.ref = qn;
+  } else if (/^\d+$/.test(res.ref) && /^\d+$/.test(qn) && qn.length > res.ref.length && !qn.endsWith(res.ref)) {
+    // Endet die RKSV-Nummer mit einer Zahl gleicher Länge, die sich nur in ein bis zwei Ziffern unterscheidet,
+    // war die gelesene Nummer vermutlich verlesen.
+    const tail = qn.slice(-res.ref.length);
+    let diff = 0;
+    for (let i = 0; i < tail.length; i++) if (tail[i] !== res.ref[i]) diff++;
+    if (diff <= 2) res.ref = tail;
+  }
+  res.rksv = true;
+  return true;
 }
 
 function applyRecognition(m, res) {
@@ -1229,6 +1271,11 @@ document.addEventListener('click', async (ev) => {
     case 'key-clear':
       S.settings.apiKey = '';
       await saveSettings();
+      render();
+      break;
+    case 'lnr':
+      S.biz.autoLnr = arg === '1';
+      await saveBiz();
       render();
       break;
     case 'lang':

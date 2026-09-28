@@ -75,6 +75,7 @@ export async function prepareImage(file) {
   const main = draw(src, 1568);
   const dataUrl = main.toDataURL('image/jpeg', 0.85);
   return {
+    src,
     thumb: draw(src, 480).toDataURL('image/jpeg', 0.7),
     base64: dataUrl.slice(dataUrl.indexOf(',') + 1),
     ocrCanvas: grayscale(draw(src, 2200, 1100)),

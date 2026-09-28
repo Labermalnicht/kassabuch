@@ -114,7 +114,8 @@ export async function buildWorkbook(biz, entries, year) {
     let r = 3;
     for (const e of monthEntries) {
       const row = ws.getRow(r);
-      row.getCell(1).value = ++lnr;
+      // LNr. nur, wenn gewünscht; sonst vergibt die Buchhaltung die Nummern selbst.
+      if (biz.autoLnr !== false) row.getCell(1).value = ++lnr;
       row.getCell(2).value = e.party || '';
       const [y, mo, d] = e.date.split('-').map(Number);
       row.getCell(3).value = new Date(Date.UTC(y, mo - 1, d));

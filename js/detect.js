@@ -158,19 +158,36 @@ export function detectReceipts(src) {
     const y0 = percentile(sy, 1);
     const y1 = percentile(sy, 99);
     let parts = [[xsAll, ysAll]];
-    // Zu breit für einen Beleg: vermutlich zwei nebeneinander, an der am dünnsten gefüllten Spalte teilen.
-    if ((x1 - x0) / (y1 - y0 + 1) > 0.6) {
-      const cols = new Float32Array(w);
-      for (const x of xsAll) cols[x]++;
-      const lo = Math.floor(x0 + (x1 - x0) * 0.3);
-      const hi = Math.floor(x0 + (x1 - x0) * 0.7);
-      let cut = lo;
-      let bestV = Infinity;
-      for (let x = lo; x < hi; x++) {
-        let s = 0;
-        for (let k = -2; k <= 2; k++) s += cols[Math.min(w - 1, Math.max(0, x + k))];
-        if (s < bestV) { bestV = s; cut = x; }
+    // Breite Fläche: zwei aneinanderliegende Belege sind fast immer verschieden lang. Geteilt wird nur,
+    // wenn Ober- oder Unterkante an einer Stelle sprunghaft wechselt (ein einzelner Beleg ist überall gleich lang).
+    let cut = -1;
+    if ((x1 - x0) / (y1 - y0 + 1) > 0.5) {
+      const colYs = Array.from({ length: w }, () => []);
+      for (let i = 0; i < xsAll.length; i++) colYs[xsAll[i]].push(ysAll[i]);
+      const top = new Float32Array(w).fill(NaN);
+      const bottom = new Float32Array(w).fill(NaN);
+      for (let x = x0; x <= x1; x++) {
+        if (colYs[x].length > 5) {
+          const s = Float32Array.from(colYs[x]).sort();
+          top[x] = percentile(s, 3);
+          bottom[x] = percentile(s, 97);
+        }
       }
+      const median = (arr, a, b) => {
+        const v = [];
+        for (let x = a; x < b; x++) if (!Number.isNaN(arr[x])) v.push(arr[x]);
+        v.sort((p, q) => p - q);
+        return v.length ? v[Math.floor(v.length / 2)] : NaN;
+      };
+      let bestStep = 0;
+      for (let c = Math.floor(x0 + (x1 - x0) * 0.25); c < Math.floor(x0 + (x1 - x0) * 0.75); c++) {
+        const step = (Math.abs(median(bottom, x0, c) - median(bottom, c, x1 + 1))
+          + Math.abs(median(top, x0, c) - median(top, c, x1 + 1))) / (y1 - y0 + 1);
+        if (step > bestStep) { bestStep = step; cut = c; }
+      }
+      if (bestStep < 0.15) cut = -1;
+    }
+    if (cut >= 0) {
       const left = [[], []];
       const right = [[], []];
       for (let i = 0; i < xsAll.length; i++) {

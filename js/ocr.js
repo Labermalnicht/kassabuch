@@ -38,6 +38,7 @@ Felder je Beleg:
 - total: der tatsächlich bezahlte Endbetrag brutto in Euro, nach Rabatten (Zeilen wie "Summe", "Gesamt", "Zu zahlen", "Total"). Nicht den gegebenen Betrag und nicht das Rück- oder Restgeld.
 - category: die passendste Kategorie aus der vorgegebenen Liste, anhand von Geschäft und Artikeln.
 - payment: "bar" bei Barzahlung (z. B. "Bar", "Gegeben", "Rückgeld"), "karte" bei Karten- oder Bankomatzahlung (z. B. "Karte", "Bankomat", "Maestro", "Visa", "Mastercard", "MC", "kontaktlos"), sonst "unbekannt".
+Hintergrund zu österreichischen Belegen: Registrierkassenbelege (RKSV) enthalten Unternehmen, fortlaufende Belegnummer, Datum und Uhrzeit, Kassen-ID, Artikel und die Beträge getrennt nach Steuersatz (20 %, 10 %, 13 %, 0 %, seit 1. 7. 2026 auch 4,9 % für Grundnahrungsmittel). Der Endbetrag ist die Summe der Bruttobeträge aller Steuersätze. Kleinbetragsrechnungen und Lieferantenrechnungen nennen den Endbetrag oft "Rechnungsbetrag", "Gesamtbetrag", "Zahlbetrag" oder "Endsumme" und die Nummer "Rechnungsnummer", "Re-Nr." oder "Rg.-Nr.". Datumsangaben stehen meist als TT.MM.JJJJ.
 Wenn ein Feld nicht lesbar ist, gib null zurück. Rate keine Werte. Ist auf dem Foto kein Beleg zu sehen, gib eine leere Liste zurück.`;
 
 function schema(categories) {
@@ -214,11 +215,14 @@ export async function recognizeOffline(canvas, biz, onProgress, altCanvas) {
 // Betrag mit zwei Nachkommastellen. Nicht Teil eines Datums ("18.09.2026"), keiner längeren Zahl und kein Prozentsatz.
 // Ohne Lookbehind, damit auch ältere iPhones den Ausdruck verstehen: das Zeichen davor wird mitgelesen.
 const AMOUNT_RE = /(^|[^\d.,])(\d{1,3}(?:\.\d{3})+|\d+)[,.]\s?(\d{2})(?!\d)(?![.,]\d)(?!\.\s?\d)(?!\s?%)/g;
-const STRONG_TOTAL = /(zu\s*zahlen|zahlbetrag|summe|gesamt|total|endbetrag|empfangen|betrag\s*eur|betrag\s*dankend)/i;
-const PAID = /(zahlung|\bbar\b|mastercard|\bmc\b|bankomat|karte|maestro|visa)/i;
-const GIVEN = /(gegeben|zahlung\s*bar|\bbar\s*eur|\bbar\b)/i;
-const CHANGE = /(r(ü|ue|u)ckgeld|restgeld|zur(ü|ue)ck)/i;
-const SKIP = /(r(ü|ue|u)ckgeld|restgeld|zur(ü|ue)ck|ersparnis|sparen|rabatt|punkte|pfand|zw-?summe|netto|mwst-?satz)/i;
+// Beschriftungen, wie sie auf österreichischen Kassenbons und Kleinbetragsrechnungen üblich sind.
+const STRONG_TOTAL = /(zu\s*(be)?zahlen|zahl(ungs)?betrag|summe|gesamt(betrag|summe)?|rechnungsbetrag|endsumme|endbetrag|bruttobetrag|total|empfangen|betrag\s*eur|betrag\s*dankend)/i;
+const PAID = /(zahlung|\bbar\b|mastercard|\bmc\b|bankomat|karte|maestro|visa|v\s?pay|debit|kredit|apple\s*pay|google\s*pay|kontaktlos|contactless|nfc|amex)/i;
+const GIVEN = /(gegeben|erhalten|zahlung\s*bar|\bbar\s*eur|\bbar\b)/i;
+const CHANGE = /(r(ü|ue|u)ckgeld|restgeld|retour|wechselgeld|zur(ü|ue)ck)/i;
+const SKIP = /(r(ü|ue|u)ckgeld|restgeld|retour|wechselgeld|zur(ü|ue)ck|ersparnis|sparen|rabatt|punkte|pfand|zw-?summe|zwischensumme|zw\.\s*summe|subtotal|netto|mwst-?satz|trinkgeld)/i;
+// Eindeutige Endbeträge zählen stärker als ein einfaches "Summe".
+const FINAL_TOTAL = /(zu\s*(be)?zahlen|endsumme|endbetrag|gesamtbetrag|gesamtsumme|rechnungsbetrag|zahl(ungs)?betrag)/i;
 
 // Belegnummer, nach Verlässlichkeit geordnet. Die "Beleg-Nr." des Kartenterminals und die
 // RKSV-Beleg-Nr. (Signaturzähler) kommen zuletzt bzw. gar nicht in Frage.
@@ -227,6 +231,7 @@ const REF_PATTERNS = [
   /\bbon\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Kassa 001 Bon 1234
   /\bb[aeo][l1i][aeo]g\s*[:#!]\s*(\d[\d/-]{2,19})\b/gi, // Beleg: 12345, auch verlesen als "Balag:"
   /\b(?:rechnungs?|rech|re|rg)[\s.-]*(?:nr|mr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,29})/gi, // Re-Nr: 0100-20260101-01-1234
+  /\b(?:beleg[\s-]*id|quittung[\s.-]*(?:nr|nummer)\.?)\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{1,29})/gi, // Beleg-ID / Quittung Nr.
   /\bbeleg(?:nummer|[\s.-]*nr\.?)\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,19})/gi, // Beleg-Nr. 1234
   /\brechnung\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Rechnung 4711
 ];
@@ -260,7 +265,7 @@ function findTotal(lines, profile) {
     a.forEach((c) => add(c, 1));
     if (STRONG_TOTAL.test(l)) {
       const own = a.length ? a : amountsIn(lines[i + 1] || '');
-      if (own.length) add(own[own.length - 1], 5);
+      if (own.length) add(own[own.length - 1], FINAL_TOTAL.test(l) ? 7 : 5);
     } else if (PAID.test(l) && a.length) {
       add(a[a.length - 1], 2);
     }
@@ -270,7 +275,8 @@ function findTotal(lines, profile) {
     }
     if (a.length >= 3) {
       const [x, y, z] = a.slice(-3);
-      if (Math.abs(x + y - z) <= 1) vatGross.push(z);
+      if (Math.abs(x + y - z) <= 1) vatGross.push(z); // netto, Steuer, brutto
+      else if (Math.abs(y + z - x) <= 1) vatGross.push(x); // brutto, netto, Steuer
     }
   });
   // Steuertabelle (netto + Steuer = brutto): bei einem Steuersatz ist brutto der Endbetrag,
@@ -285,14 +291,24 @@ function findTotal(lines, profile) {
   return best ? best[0] : null;
 }
 
+const MONTHS = { jan: 1, jän: 1, jaen: 1, feb: 2, mär: 3, mar: 3, maer: 3, apr: 4, mai: 5, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, okt: 10, oct: 10, nov: 11, dez: 12, dec: 12 };
+
 function findDate(text) {
   const counts = new Map();
-  const re = /(\d{1,2})\s?[./-]\s?(\d{1,2})\s?[./,-]\s?(20\d{2}|\d{2})(?!\d)/g;
-  let m;
-  while ((m = re.exec(text))) {
-    const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
-    const iso = plausibleDate(`${y}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`);
+  const add = (y, mo, d) => {
+    const iso = plausibleDate(`${y}-${String(mo).padStart(2, '0')}-${String(d).padStart(2, '0')}`);
     if (iso) counts.set(iso, (counts.get(iso) || 0) + 1);
+  };
+  let m;
+  const dmy = /(\d{1,2})\s?[./-]\s?(\d{1,2})\s?[./,-]\s?(20\d{2}|\d{2})(?!\d)/g;
+  while ((m = dmy.exec(text))) add(m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]), m[2], m[1]);
+  const ymd = /(20\d{2})-(\d{2})-(\d{2})(?!\d)/g;
+  while ((m = ymd.exec(text))) add(m[1], m[2], m[3]);
+  const named = /(\d{1,2})\.?\s*(j(?:ä|ae|a)n|feb|m(?:ä|ae|a)r|apr|mai|may|jun|jul|aug|sep|okt|oct|nov|dez|dec)[a-zä]*\.?\s*(20\d{2})/gi;
+  while ((m = named.exec(text))) {
+    const key = m[2].toLowerCase().replace('ae', 'ä');
+    const mo = MONTHS[key] || MONTHS[key.slice(0, 3)];
+    if (mo) add(m[3], mo, m[1]);
   }
   let best = null;
   for (const [d, n] of counts) if (!best || n > best[1]) best = [d, n];
@@ -342,7 +358,7 @@ export function parseReceiptText(text, biz) {
   }
   if (!supplier) {
     // Firmenzeile mit Rechtsform, z. B. "... OG", "... GmbH", "... KG"
-    supplier = lines.slice(0, 15).find((l) => /\b(GmbH|GesmbH|OG|0G|KG|AG|e\.\s?U\.)\b/.test(l)
+    supplier = lines.slice(0, 15).find((l) => /(?:^|[\s,])(GmbH|GesmbH|Ges\.?\s?m\.?\s?b\.?\s?H\.?|mbH|OG|0G|KG|AG|SE|e\.\s?U\.?|eU)(?=$|[\s,.&])/.test(l)
       && (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 5) || '';
   }
   if (!supplier) {
@@ -353,7 +369,7 @@ export function parseReceiptText(text, biz) {
   if (!supplier) {
     // erste Textzeile, aber keine Branchen-, Adress- oder Formularzeilen
     supplier = lines.slice(0, 12).find((l) => (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 4
-      && !/^(rechnung|beleg|kassa|datum|summe|www|tel|uid|atu)/i.test(l)
+      && !/^(rechnung|beleg|kassa|kassenbon|quittung|datum|summe|www|tel|uid|atu|fn\s)/i.test(l)
       && !/(handel|gemüse|gemuese|obst|stra(ss|ß)e|gasse|platz|markt\s*\d|wien|graz|linz|salzburg|filiale|\b\d{4}\b)/i.test(l)) || '';
   }
   supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim()
@@ -366,8 +382,8 @@ export function parseReceiptText(text, biz) {
 
   // Zahlungsart
   let payment = 'unbekannt';
-  if (/bankomat|maestro|visa|mastercard|kontaktlos|contactless|kartenzahlung|zahlung\s*karte|debit|kreditkarte|gegeben\s*mc/i.test(full)) payment = 'karte';
-  else if (/\bbar\b|gegeben|r(ü|ue)ckgeld|restgeld/i.test(full)) payment = 'bar';
+  if (/bankomat|maestro|visa|v\s?pay|mastercard|kontaktlos|contactless|kartenzahlung|zahlung\s*karte|debit|kreditkarte|apple\s*pay|google\s*pay|amex|gegeben\s*mc/i.test(full)) payment = 'karte';
+  else if (/\bbar\b|barzahlung|bar\s*bezahlt|gegeben|r(ü|ue)ckgeld|restgeld|retour|wechselgeld/i.test(full)) payment = 'bar';
 
   const date = findDate(full);
   let ref = findRef(full, profile);
@@ -403,6 +419,8 @@ export function fingerprintsOf(text) {
     if (/^\d{8}$/.test(d)) ids.add(`ATU${d}`);
   }
   for (const m of text.matchAll(/(?:www\.\s?|https?:\/\/(?:[a-z0-9-]+\.)?)([a-z0-9-]{3,}\.(?:at|de|com|eu|net))\b/gi)) ids.add(m[1].toLowerCase());
+  // Firmenbuchnummer, z. B. "FN 123456a"
+  for (const m of text.matchAll(/\bFN\s?(\d{4,6}\s?[a-z])\b/gi)) ids.add(`FN${m[1].replace(/\s/g, '').toLowerCase()}`);
   return [...ids];
 }
 
