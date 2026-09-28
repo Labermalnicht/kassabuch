@@ -1,6 +1,6 @@
 // Belegerkennung: mit API-Schlüssel über Claude, sonst offline mit Tesseract.
 import { t } from './i18n.js';
-import { KNOWN_CHAINS, findLearned, suggest, similarity } from './templates.js';
+import { KNOWN_CHAINS, findLearned, suggest, similarity, chainByUid } from './templates.js';
 import { parseAmount, todayISO } from './ledger.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
@@ -357,6 +357,11 @@ export function parseReceiptText(text, biz) {
       const hit = findLearned(biz, l);
       if (hit) { supplier = hit.name; profile = hit; break; }
     }
+  }
+  // 3. UID-Nummer einer bekannten Kette auf dem Beleg (sicherer als ein verlesener Name)
+  if (!supplier) {
+    const hit = fingerprintsOf(full).map((id) => chainByUid(biz, id)).find(Boolean);
+    if (hit) supplier = hit.name;
   }
   if (!supplier) {
     const chain = lines.find((l) => KNOWN_CHAINS.some((re) => re.test(l)));

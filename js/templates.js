@@ -82,23 +82,24 @@ const HARDWARE = ['Renovierungsmaterial', 'Material', 'Werkzeug', 'Reparaturen',
 const DECOR = ['Einrichtung und Deko', 'Ladeneinrichtung und Deko', 'Blumen und Dekoration', 'Interio', 'Sonstiges'];
 const PRESETS = [
   // refTail: die Zahl unter dem Strichcode endet mit der Bonnummer (4 Stellen).
-  { re: /\b(inter|euro)?spar\b|warenhandels/i, name: 'SPAR', cats: FOOD, refTail: 4 },
-  { re: /\bbilla\b/i, name: 'BILLA', cats: FOOD },
-  { re: /\bhofer\b/i, name: 'HOFER KG', cats: FOOD },
-  { re: /\blidl\b/i, name: 'LIDL', cats: FOOD },
-  { re: /\bpenny\b/i, name: 'PENNY', cats: FOOD },
-  { re: /\bmpreis\b|\bm-preis\b/i, name: 'MPREIS', cats: FOOD },
-  { re: /\bunimarkt\b/i, name: 'Unimarkt', cats: FOOD },
+  // uids: UID-Nummern laut Impressum der Kette (Stand September 2026). Sie stehen auf dem Beleg und oft im QR-Code.
+  { re: /\b(inter|euro)?spar\b|warenhandels/i, name: 'SPAR', cats: FOOD, refTail: 4, uids: ['ATU33803701'] },
+  { re: /\bbilla\b/i, name: 'BILLA', cats: FOOD, uids: ['ATU15255907'] },
+  { re: /\bhofer\b/i, name: 'HOFER KG', cats: FOOD, uids: ['ATU78172745'] },
+  { re: /\blidl\b/i, name: 'LIDL', cats: FOOD, uids: ['ATU37893801'] },
+  { re: /\bpenny\b/i, name: 'PENNY', cats: FOOD, uids: ['ATU43203403'] },
+  { re: /\bmpreis\b|\bm-preis\b/i, name: 'MPREIS', cats: FOOD, uids: ['ATU30961901'] },
+  { re: /\bunimarkt\b/i, name: 'Unimarkt', cats: FOOD, uids: ['ATU22795704'] },
   { re: /nah\s*&\s*frisch/i, name: 'Nah&Frisch', cats: FOOD },
   { re: /\badeg\b/i, name: 'ADEG', cats: FOOD },
   { re: /\bmaximarkt\b/i, name: 'Maximarkt', cats: FOOD },
   { re: /\bkastner\b/i, name: 'Kastner', cats: WHOLESALE },
   { re: /\bwedl\b/i, name: 'Wedl', cats: WHOLESALE },
   { re: /\brossmann\b/i, name: 'Rossmann', cats: DRUGSTORE },
-  { re: /\bmetro\b/i, name: 'METRO', cats: WHOLESALE },
-  { re: /transgourmet/i, name: 'Transgourmet Österreich GmbH', cats: WHOLESALE },
-  { re: /\bbipa\b/i, name: 'BIPA', cats: DRUGSTORE },
-  { re: /\bdm\b|drogerie ?markt/i, name: 'dm drogerie markt GmbH', cats: DRUGSTORE },
+  { re: /\bmetro\b/i, name: 'METRO', cats: WHOLESALE, uids: ['ATU19424905'] },
+  { re: /transgourmet/i, name: 'Transgourmet Österreich GmbH', cats: WHOLESALE, uids: ['ATU47972001'] },
+  { re: /\bbipa\b/i, name: 'BIPA', cats: DRUGSTORE, uids: ['ATU19434404'] },
+  { re: /\bdm\b|drogerie ?markt/i, name: 'dm drogerie markt GmbH', cats: DRUGSTORE, uids: ['ATU35195908'] },
   { re: /\bm(ü|ue|u)ller\b/i, name: 'Müller', cats: DRUGSTORE },
   { re: /\baction\b/i, name: 'ACTION', cats: ['Sonstiges'] },
   { re: /\bikea\b|m(ö|oe)belix|\bkika\b|xxxlutz/i, name: null, cats: DECOR },
@@ -118,6 +119,37 @@ const PRESETS = [
 ];
 
 export const KNOWN_CHAINS = PRESETS.map((p) => p.re);
+
+// Konzerne, die die Kassen mehrerer Ketten unter einer gemeinsamen UID signieren (Ordnungsbegriff im QR-Code).
+// Die Endung nach dem Bindestrich unterscheidet die Gesellschaften; bestätigte Endungen stehen in known.
+const RKSV_GROUPS = {
+  ATU59193205: { group: 'REWE Group', chains: ['BILLA', 'PENNY', 'BIPA'], known: { '001': 'BILLA' } },
+};
+
+const presetOf = (name) => PRESETS.find((p) => p.name === name) || null;
+const catFor = (biz, p) => (p ? p.cats.find((c) => biz.categories.includes(c)) || null : null);
+
+/** Kette zu einer UID-Nummer (z. B. "ATU15255907"), sonst null. */
+export function chainByUid(biz, uid) {
+  const u = String(uid || '').toUpperCase().replace(/\s/g, '');
+  const p = PRESETS.find((x) => x.name && (x.uids || []).includes(u));
+  return p ? { name: p.name, cat: catFor(biz, p) } : null;
+}
+
+/**
+ * Kette zum Feld Zertifikat/Ordnungsbegriff des RKSV-Codes, z. B. "U:ATU59193205-001".
+ * Ergebnis: { name, cat } bei eindeutiger Zuordnung, { group, chains } wenn nur der Konzern bekannt ist, sonst null.
+ */
+export function chainByRksv(biz, cert) {
+  const m = String(cert || '').toUpperCase().match(/^U:(ATU\d{8})(?:-(\w+))?/);
+  if (!m) return null;
+  const g = RKSV_GROUPS[m[1]];
+  if (g) {
+    const name = m[2] && g.known[m[2]];
+    return name ? { name, cat: catFor(biz, presetOf(name)) } : { group: g.group, chains: g.chains };
+  }
+  return chainByUid(biz, m[1]);
+}
 
 // Typische Lesefehler der Texterkennung angleichen: 0/O, 1/l/I, 5/S, 6/G, 8/B.
 const fold = (s) => normKey(s).replace(/0/g, 'o').replace(/[1l]/g, 'i').replace(/5/g, 's').replace(/6/g, 'g').replace(/8/g, 'b');

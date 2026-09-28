@@ -1,6 +1,6 @@
 import * as db from './db.js';
 import { t, setLang, getLang } from './i18n.js';
-import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest, similarity } from './templates.js';
+import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest, similarity, chainByRksv } from './templates.js';
 import {
   parseAmount, fmtMoney, fmtAmountInput, fmtDate, fmtDay, fmtMonth, shiftMonth,
   withBalances, currentBalance, todayISO, uid,
@@ -470,7 +470,8 @@ function viewModal() {
     title = t('supAsk.title');
     const names = [...new Set(Object.values(S.biz.suppliers || {}).map((x) => x.name))].sort((a, b) => a.localeCompare(b));
     body = `${m.preview ? `<img class="sup-ask-img" src="${m.preview}" alt="${esc(t('ocr.photo'))}">` : ''}
-<p class="sup-ask-hint">${t('supAsk.hint')}</p>
+<p class="sup-ask-hint">${m.group ? esc(t('supAsk.group', { group: m.group })) : t('supAsk.hint')}</p>
+${m.chains && m.chains.length ? `<div class="chips">${m.chains.map((n) => `<button type="button" class="chip-btn" data-act="sup-ask-pick:${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
 ${field(t('f.supplier'), `<input type="text" id="sup-ask-input" list="sup-ask-list" value="${esc(m.name || '')}" autocomplete="off" enterkeyhint="done">`)}
 <datalist id="sup-ask-list">${names.map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>`;
     foot = `<button class="btn primary grow" data-act="sup-ask-ok">${icon('check')}<span>${t('supAsk.ok')}</span></button>`;
@@ -509,6 +510,7 @@ function ocrBox(o) {
   } else if (o.status === 'scan') {
     parts.push(`<div class="ocr ok">${icon('qr')}<span>${t('ocr.scanDone')}</span></div>`);
     if (o.saved) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.supplierSaved', { name: o.saved }))}</span></div>`);
+    else if (o.chain) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.chainFound', { name: o.chain }))}</span></div>`);
     else if (o.known) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.known', { name: o.known }))}</span></div>`);
     return parts.join('');
   } else if (o.status === 'claude' || o.status === 'offline') {
@@ -983,10 +985,12 @@ async function saveEntry() {
       if (l.refLabel) learned.refLabel = l.refLabel;
       if (l.totalLabel) learned.totalLabel = l.totalLabel;
       if (l.refTail) learned.refTail = l.refTail;
-      learned.ids = [...new Set([...(old.ids || []), ...l.ids])].slice(0, 6);
+      learned.ids = mergeIds(old.ids, l.ids);
     }
-    // Kassen-ID aus dem RKSV-Code: dieselbe Kasse liefert beim nächsten Scan sofort den Lieferanten.
-    if (m.kassenId) learned.ids = [...new Set([...(learned.ids || old.ids || []), `KASSE:${m.kassenId}`])].slice(-12);
+    // Merkmale aus dem RKSV-Code: dieselbe Kasse oder dasselbe Unternehmen liefert beim nächsten Scan sofort den Lieferanten.
+    if (m.kassenId) {
+      learned.ids = mergeIds(learned.ids || old.ids, [`KASSE:${m.kassenId}`, ...(m.rksvCert ? [`RKSV:${m.rksvCert}`] : [])]);
+    }
     Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
     sup[normKey(e.party)] = learned;
     if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) sup[normKey(m.ocrSupplier)] = learned;
@@ -1078,8 +1082,35 @@ async function openScanner(count = 0, fresh = false) {
   });
 }
 
-function kassenProfile(kassenId) {
-  return Object.values(S.biz.suppliers || {}).find((s) => (s.ids || []).includes(`KASSE:${kassenId}`)) || null;
+// Merkmale eines Lieferanten zusammenführen. Unternehmensmerkmale (UID, Internetadresse, RKSV-Zertifikat) bleiben
+// erhalten; von den Kassen-IDs werden nur die letzten 30 behalten, damit viele Filialen nichts anderes verdrängen.
+function mergeIds(oldIds, add) {
+  const all = [...new Set([...(oldIds || []), ...add])];
+  const kassen = all.filter((id) => id.startsWith('KASSE:'));
+  return [...all.filter((id) => !id.startsWith('KASSE:')).slice(-12), ...kassen.slice(-30)];
+}
+
+// Merkmale eines RKSV-Codes: die Kasse und das Unternehmen (Ordnungsbegriff bzw. Zertifikat, gleich für alle Filialen).
+const rksvIds = (q) => [`KASSE:${q.kassenId}`, ...(q.cert ? [`RKSV:${q.cert}`] : [])];
+
+function kassenProfile(q) {
+  const ids = rksvIds(q);
+  return Object.values(S.biz.suppliers || {}).find((s) => (s.ids || []).some((id) => ids.includes(id))) || null;
+}
+
+// Lieferant anlegen oder ergänzen und die Merkmale des Codes dazu speichern.
+async function rememberRksvSupplier(q, name, cat) {
+  const sup = { ...(S.biz.suppliers || {}) };
+  const key = Object.keys(sup).find((k) => normKey(sup[k].name) === normKey(name)) || normKey(name);
+  const old = sup[key] || {};
+  const sug = suggest(S.biz, name);
+  sup[key] = {
+    ...old, name: old.name || name, cat: old.cat || cat || (sug && sug.cat) || '', count: old.count || 0,
+    ids: mergeIds(old.ids, rksvIds(q)),
+  };
+  S.biz.suppliers = sup;
+  await saveBiz();
+  return sup[key];
 }
 
 // Kleines Vorschaubild des Kamerabilds.
@@ -1093,34 +1124,39 @@ function framePreview(frame) {
   return c.toDataURL('image/jpeg', 0.7);
 }
 
-// Bekannte Kasse: gleich ins Formular. Unbekannte Kasse: Lieferant einmal von Hand eintragen, er wird zur Kassen-ID
-// gespeichert und bei allen künftigen Scans dieser Kasse automatisch übernommen.
-function askOrOpenRksv(q, frame) {
-  const prof = kassenProfile(q.kassenId);
-  if (prof) { openFromRksv(q, frame, prof, false); return; }
-  S.modal = { type: 'supplierAsk', token: uid(), q, frame, preview: framePreview(frame), rksvKey: `${q.kassenId}|${q.belegNr}` };
+// Lieferant zum Code: 1. gespeichert (dieselbe Kasse oder dasselbe Unternehmen), 2. eingebaute Liste der Ketten
+// (UID im Code), 3. sonst einmal von Hand eintragen. Das Ergebnis wird gespeichert und gilt für alle künftigen Scans.
+async function askOrOpenRksv(q, frame) {
+  const prof = kassenProfile(q);
+  if (prof) {
+    // Neue Kasse oder Filiale eines schon bekannten Unternehmens: Merkmale ergänzen.
+    if (!rksvIds(q).every((id) => (prof.ids || []).includes(id))) await rememberRksvSupplier(q, prof.name, prof.cat);
+    openFromRksv(q, frame, prof, 'known');
+    return;
+  }
+  const chain = chainByRksv(S.biz, q.cert);
+  if (chain && chain.name) {
+    openFromRksv(q, frame, await rememberRksvSupplier(q, chain.name, chain.cat), 'chain');
+    return;
+  }
+  S.modal = {
+    type: 'supplierAsk', token: uid(), q, frame, preview: framePreview(frame), rksvKey: `${q.kassenId}|${q.belegNr}`,
+    group: chain ? chain.group : '', chains: chain ? chain.chains : [],
+  };
   renderModal();
-  setTimeout(() => document.getElementById('sup-ask-input')?.focus(), 50);
+  if (!chain) setTimeout(() => document.getElementById('sup-ask-input')?.focus(), 50);
 }
 
-async function confirmSupplierAsk() {
+async function confirmSupplierAsk(picked) {
   const m = S.modal;
   if (!m || m.type !== 'supplierAsk') return;
-  const name = (document.getElementById('sup-ask-input')?.value || '').replace(/\s+/g, ' ').trim();
+  const name = (picked || document.getElementById('sup-ask-input')?.value || '').replace(/\s+/g, ' ').trim();
   if (!name) { showToast(t('err.supplier'), 'err'); return; }
-  const id = `KASSE:${m.q.kassenId}`;
-  const sup = { ...(S.biz.suppliers || {}) };
-  const key = Object.keys(sup).find((k) => normKey(sup[k].name) === normKey(name)) || normKey(name);
-  const old = sup[key] || {};
-  const sug = suggest(S.biz, name);
-  const cat = old.cat || (sug && sug.cat) || '';
-  sup[key] = { ...old, name: old.name || name, cat, count: old.count || 0, ids: [...new Set([...(old.ids || []), id])].slice(-12) };
-  S.biz.suppliers = sup;
-  await saveBiz();
-  openFromRksv(m.q, m.frame, sup[key], true);
+  openFromRksv(m.q, m.frame, await rememberRksvSupplier(m.q, name), 'saved');
 }
 
-function openFromRksv(q, frame, prof, saved) {
+// how: 'known' (schon gespeichert), 'chain' (aus der Liste der Ketten), 'saved' (eben eingetragen)
+function openFromRksv(q, frame, prof, how) {
   openEntry('receipt', {
     date: q.date, amount: fmtAmountInput(q.total), ref: q.belegNr,
     party: prof.name, desc: (prof.cat && S.biz.categories.includes(prof.cat)) ? prof.cat : (S.biz.categories[0] || ''),
@@ -1131,7 +1167,9 @@ function openFromRksv(q, frame, prof, saved) {
   // Werte aus dem Code sind exakt, der Lieferant ist gespeichert.
   ['date', 'amount', 'ref', 'party', 'desc'].forEach((k) => m.touched.add(k));
   m.preview = framePreview(frame);
-  m.ocr = saved ? { status: 'scan', saved: prof.name } : { status: 'scan', known: prof.name };
+  m.rksvCert = q.cert || '';
+  m.ocr = how === 'known' ? { status: 'scan', known: prof.name }
+    : how === 'chain' ? { status: 'scan', chain: prof.name } : { status: 'scan', saved: prof.name };
   renderModal();
 }
 
@@ -1293,6 +1331,7 @@ document.addEventListener('click', async (ev) => {
       break;
     case 'entry-save': saveEntry(); break;
     case 'sup-ask-ok': confirmSupplierAsk(); break;
+    case 'sup-ask-pick': confirmSupplierAsk(arg); break;
     case 'crop-use': useCrop(false); break;
     case 'crop-pick': {
       const m = S.modal;

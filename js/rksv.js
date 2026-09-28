@@ -3,9 +3,12 @@
 //   _R1-AT<n>_<Kassen-ID>_<Belegnummer>_<JJJJ-MM-TTThh:mm:ss>_<Betrag Normal 20 %>_<Ermäßigt-1 10 %>
 //   _<Ermäßigt-2 13 %>_<Null 0 %>_<Besonders 19 % bzw. seit 1. 7. 2026 auch 4,9 %>_<Umsatzzähler>_<Zertifikat>_<Signaturen>
 // Beträge sind Bruttobeträge mit Dezimalkomma. Daraus ergeben sich Datum und Endbetrag exakt.
+// Das Feld Zertifikat enthält bei Kassen großer Unternehmen (geschlossenes System) den Ordnungsbegriff, meist die
+// UID-Nummer mit Endung ("U:ATU12345678-001"), sonst die Seriennummer des Signaturzertifikats des Betriebs.
+// Beides bleibt für alle Kassen und Filialen eines Unternehmens gleich, die Kassen-ID dagegen nicht.
 
 const QR_LIB = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
-const RKSV_RE = /_R1-AT\d+_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::\d{2})?_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_/;
+const RKSV_RE = /_R1-AT\d+_([^_]+)_([^_]+)_(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(?::\d{2})?_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(-?\d+[.,]\d{2})_(?:[^_]*_([^_]+))?/;
 
 const cents = (s) => Math.round(parseFloat(s.replace(',', '.')) * 100);
 
@@ -17,7 +20,7 @@ export function parseRksv(text) {
     normal: cents(m[5]), erm1: cents(m[6]), erm2: cents(m[7]), null: cents(m[8]), besonders: cents(m[9]),
   };
   const total = Object.values(amounts).reduce((s, v) => s + v, 0);
-  return { kassenId: m[1], belegNr: m[2], date: m[3], time: m[4], amounts, total };
+  return { kassenId: m[1], belegNr: m[2], date: m[3], time: m[4], amounts, total, cert: m[10] || '' };
 }
 
 let libPromise = null;
