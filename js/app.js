@@ -455,10 +455,10 @@ function ocrBox(o) {
   const parts = [];
   if (o.status === 'running') {
     parts.push(`<div class="ocr run"><span class="spinner"></span><span>${t(o.offline ? 'ocr.runningOffline' : 'ocr.running')} <span id="ocr-progress"></span></span></div>`);
-  } else if (o.status === 'claude') {
-    parts.push(`<div class="ocr ok">${icon('check')}<span>${t('ocr.doneClaude')}</span></div>`);
-  } else if (o.status === 'offline') {
-    parts.push(`<div class="ocr warn">${icon('alert')}<span>${t('ocr.doneOffline')}</span></div>`);
+  } else if (o.status === 'claude' || o.status === 'offline') {
+    // Immer sichtbar, sobald Daten aus dem Foto vorliegen.
+    parts.push(`<div class="ocr warn">${icon('alert')}<span>${t(o.status === 'claude' ? 'ocr.doneClaude' : 'ocr.doneOffline')} ${t('ocr.check')}</span></div>`);
+    if (o.known) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.known', { name: o.known }))}</span></div>`);
   } else if (o.status === 'error') {
     parts.push(`<div class="ocr err">${icon('alert')}<span>${esc(o.msg || t('ocr.failed'))}</span></div>`);
   }
@@ -707,7 +707,7 @@ async function processNext() {
   syncModal();
   applyRecognition(m, res);
   m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
-  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt, multi, tip: res.source === 'offline' };
+  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt, multi, tip: res.source === 'offline', known: res.known };
   renderModal();
 }
 
@@ -715,6 +715,7 @@ function applyRecognition(m, res) {
   const d = m.data;
   const free = (k) => !m.touched.has(k);
   m.ocrSupplier = res.supplier || '';
+  m.ocrText = res.text || '';
   const sug = res.supplier ? suggest(S.biz, res.supplier) : null;
   if (free('party') && res.supplier) d.party = (sug && sug.name) || res.supplier;
   if (free('date') && res.date) d.date = res.date;
@@ -796,9 +797,20 @@ async function saveEntry() {
     await saveBiz();
   }
   if (kind === 'receipt' || (kind === 'manual' && e.dir === 'out' && S.biz.categories.includes(e.desc))) {
-    const learned = { name: e.party, cat: e.desc };
-    S.biz.suppliers = { ...(S.biz.suppliers || {}), [normKey(e.party)]: learned };
-    if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) S.biz.suppliers[normKey(m.ocrSupplier)] = learned;
+    // Lieferantenprofil: Name, Kategorie, Häufigkeit und was sich aus dem Foto über den Aufbau des Belegs lernen lässt.
+    const sup = { ...(S.biz.suppliers || {}) };
+    const old = Object.values(sup).find((s) => s.name === e.party) || {};
+    const learned = { ...old, name: e.party, cat: e.desc, count: (old.count || 0) + 1 };
+    if (kind === 'receipt' && m.ocrText) {
+      const l = ocr.learnFromReceipt(m.ocrText, { ref: e.ref, amount: e.amount });
+      if (l.refLabel) learned.refLabel = l.refLabel;
+      if (l.totalLabel) learned.totalLabel = l.totalLabel;
+      learned.ids = [...new Set([...(old.ids || []), ...l.ids])].slice(0, 6);
+    }
+    Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
+    sup[normKey(e.party)] = learned;
+    if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) sup[normKey(m.ocrSupplier)] = learned;
+    S.biz.suppliers = sup;
     await saveBiz();
   }
   db.requestPersistence();

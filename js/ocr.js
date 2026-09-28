@@ -1,6 +1,6 @@
 // Belegerkennung: mit API-Schlüssel über Claude, sonst offline mit Tesseract.
 import { t } from './i18n.js';
-import { KNOWN_CHAINS, findLearned } from './templates.js';
+import { KNOWN_CHAINS, findLearned, suggest } from './templates.js';
 import { parseAmount, todayISO } from './ledger.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
@@ -73,7 +73,10 @@ const BRANCH = {
 };
 
 function userText(biz) {
-  const known = [...new Set(Object.values(biz.suppliers || {}).map((s) => s.name))].slice(0, 80);
+  const byName = new Map();
+  Object.values(biz.suppliers || {}).forEach((s) => { if (s.name && (!byName.has(s.name) || s.refLabel)) byName.set(s.name, s); });
+  const known = [...byName.values()].sort((a, b) => (b.count || 0) - (a.count || 0)).slice(0, 60)
+    .map((s) => (s.refLabel ? `${s.name} (Belegnummer steht nach "${s.refLabel}")` : s.name));
   return [
     `Branche: ${BRANCH[biz.template] || 'Kleinbetrieb'}`,
     `Kategorien: ${biz.categories.join(', ')}`,
@@ -237,8 +240,9 @@ function amountsIn(line) {
 
 // Endbetrag per Punktevergabe: Summenzeilen, Zahlungszeilen, MwSt-Tabellen (netto + Steuer = brutto),
 // "Gegeben minus Rückgeld" und die Häufigkeit eines Betrags sprechen jeweils für ihn.
-function findTotal(lines) {
+function findTotal(lines, profile) {
   const score = new Map();
+  const label = profile && profile.totalLabel;
   const add = (c, pts) => { if (c) score.set(c, (score.get(c) || 0) + pts); };
   let given = null;
   let change = null;
@@ -253,6 +257,10 @@ function findTotal(lines) {
       if (own.length) add(own[own.length - 1], 5);
     } else if (PAID.test(l) && a.length) {
       add(a[a.length - 1], 2);
+    }
+    if (label && lineLetters(l).includes(label)) {
+      const own = a.length ? a : amountsIn(lines[i + 1] || '');
+      if (own.length) add(own[own.length - 1], 8);
     }
     if (a.length >= 3) {
       const [x, y, z] = a.slice(-3);
@@ -281,7 +289,14 @@ function findDate(text) {
   return best ? best[0] : null;
 }
 
-function findRef(text) {
+function findRef(text, profile) {
+  if (profile && profile.refLabel) {
+    const esc = profile.refLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*');
+    const re = new RegExp(`(?:^|[^a-zäöüß])${esc}\\s*[:#.]?\\s*([A-Z0-9][A-Z0-9/-]{1,29})`, 'gi');
+    for (const m of text.matchAll(re)) {
+      if (/\d/.test(m[1]) && !REF_EXCLUDE.test(m[0])) return m[1].replace(/[/-]+$/, '');
+    }
+  }
   for (const re of REF_PATTERNS) {
     for (const m of text.matchAll(re)) {
       const before = text.slice(Math.max(0, m.index - 12), m.index);
@@ -299,9 +314,15 @@ export function parseReceiptText(text, biz) {
   // Lieferant: gelernter Lieferant, bekannte Kette (auch in "Vielen Dank ... bei SPAR" oder der Internetadresse)
   // oder die erste Zeile mit Buchstaben.
   let supplier = '';
-  for (const l of lines.slice(0, 25)) {
-    const hit = findLearned(biz, l);
-    if (hit) { supplier = hit.name; break; }
+  // 1. Merkmale früherer Belege (UID-Nummer, Internetadresse) erkennen den Lieferanten auch bei verlesenem Namen.
+  let profile = profileByFingerprint(biz, fingerprintsOf(full));
+  if (profile) supplier = profile.name;
+  // 2. gespeicherte Lieferanten, auch unscharf
+  if (!supplier) {
+    for (const l of lines.slice(0, 25)) {
+      const hit = findLearned(biz, l);
+      if (hit) { supplier = hit.name; profile = hit; break; }
+    }
   }
   if (!supplier) {
     const chain = lines.find((l) => KNOWN_CHAINS.some((re) => re.test(l)));
@@ -318,6 +339,10 @@ export function parseReceiptText(text, biz) {
   }
   supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim()
     .replace(/\b0G\b/g, 'OG').replace(/\bGmbh\b/g, 'GmbH').replace(/\bK6\b/g, 'KG').slice(0, 60);
+  if (!profile && supplier) {
+    const sug = suggest(biz, supplier);
+    profile = findLearned(biz, (sug && sug.name) || supplier);
+  }
 
   // Zahlungsart
   let payment = 'unbekannt';
@@ -325,7 +350,49 @@ export function parseReceiptText(text, biz) {
   else if (/\bbar\b|gegeben|r(ü|ue)ckgeld|restgeld/i.test(full)) payment = 'bar';
 
   return {
-    source: 'offline', isReceipt: true, supplier, date: findDate(full), ref: findRef(full),
-    amount: findTotal(lines), category: null, payment,
+    source: 'offline', isReceipt: true, supplier, date: findDate(full), ref: findRef(full, profile),
+    amount: findTotal(lines, profile), category: null, payment, text: full, known: profile ? profile.name : '',
   };
+}
+
+// ---------- Lernen aus bestätigten Belegen ----------
+
+const lineLetters = (l) => l.toLowerCase().replace(/[^a-zäöüß\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+
+// Merkmale eines Lieferanten: UID-Nummer (ATU...) und Internetadresse.
+export function fingerprintsOf(text) {
+  const ids = new Set();
+  for (const m of text.matchAll(/\bATU\s?(\d{8})\b/gi)) ids.add(`ATU${m[1]}`);
+  for (const m of text.matchAll(/(?:www\.|https?:\/\/(?:[a-z0-9-]+\.)?)([a-z0-9-]{3,}\.(?:at|de|com|eu|net))\b/gi)) ids.add(m[1].toLowerCase());
+  return [...ids];
+}
+
+function profileByFingerprint(biz, ids) {
+  if (!ids.length) return null;
+  return Object.values(biz.suppliers || {}).find((s) => (s.ids || []).some((id) => ids.includes(id))) || null;
+}
+
+// Was lässt sich aus einem bestätigten Beleg über den Lieferanten lernen?
+// refLabel: Beschriftung vor der Belegnummer, totalLabel: Beschriftung der Betragszeile, ids: Merkmale.
+export function learnFromReceipt(text, { ref, amount }) {
+  const out = { refLabel: '', totalLabel: '', ids: fingerprintsOf(text || '') };
+  if (!text) return out;
+  if (ref) {
+    const idx = text.toLowerCase().indexOf(String(ref).toLowerCase());
+    if (idx > 0) {
+      const before = text.slice(Math.max(0, idx - 30), idx).split('\n').pop();
+      const m = before.match(/([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß.-]{1,20})\s*[:#.]?\s*$/);
+      if (m && !REF_EXCLUDE.test(m[1])) out.refLabel = m[1].toLowerCase().replace(/[.:-]+$/, '');
+    }
+  }
+  if (amount) {
+    const eur = (amount / 100).toFixed(2);
+    const variants = [eur, eur.replace('.', ',')];
+    const candidates = text.split('\n').filter((l) => variants.some((v) => l.includes(v)))
+      .map((l) => lineLetters(l.slice(0, l.indexOf(variants.find((v) => l.includes(v))))).split(' ').slice(0, 3).join(' '))
+      .filter((lbl) => lbl.replace(/[\s-]/g, '').length >= 3);
+    const pick = candidates.find((lbl) => STRONG_TOTAL.test(lbl)) || candidates.find((lbl) => !PAID.test(lbl) && !GIVEN.test(lbl) && !CHANGE.test(lbl));
+    if (pick) out.totalLabel = pick;
+  }
+  return out;
 }
