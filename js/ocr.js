@@ -1,6 +1,6 @@
 // Belegerkennung: mit API-Schlüssel über Claude, sonst offline mit Tesseract.
 import { t } from './i18n.js';
-import { KNOWN_CHAINS, findLearned, suggest } from './templates.js';
+import { KNOWN_CHAINS, findLearned, suggest, similarity } from './templates.js';
 import { parseAmount, todayISO } from './ledger.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
@@ -220,7 +220,7 @@ const SKIP = /(r(ü|ue|u)ckgeld|restgeld|zur(ü|ue)ck|ersparnis|sparen|rabatt|pu
 const REF_PATTERNS = [
   /\bbon[\s.-]*(?:nr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,19})/gi, // Bon-Nr.: 1234
   /\bbon\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Kassa 001 Bon 1234
-  /\bbeleg\s*[:#]\s*(\d[\d/-]{2,19})\b/gi, // Beleg: 12345
+  /\bb[aeo][l1i][aeo]g\s*[:#!]\s*(\d[\d/-]{2,19})\b/gi, // Beleg: 12345, auch verlesen als "Balag:"
   /\b(?:rechnungs?|rech|re|rg)[\s.-]*(?:nr|mr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,29})/gi, // Re-Nr: 0100-20260101-01-1234
   /\bbeleg(?:nummer|[\s.-]*nr\.?)\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,19})/gi, // Beleg-Nr. 1234
   /\brechnung\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Rechnung 4711
@@ -246,6 +246,7 @@ function findTotal(lines, profile) {
   const add = (c, pts) => { if (c) score.set(c, (score.get(c) || 0) + pts); };
   let given = null;
   let change = null;
+  const vatGross = [];
   lines.forEach((l, i) => {
     const a = amountsIn(l);
     if (CHANGE.test(l)) { if (a.length) change = a[a.length - 1]; else { const n = amountsIn(lines[i + 1] || ''); if (n.length) change = n[0]; } }
@@ -264,9 +265,13 @@ function findTotal(lines, profile) {
     }
     if (a.length >= 3) {
       const [x, y, z] = a.slice(-3);
-      if (Math.abs(x + y - z) <= 1) add(z, 4);
+      if (Math.abs(x + y - z) <= 1) vatGross.push(z);
     }
   });
+  // Steuertabelle (netto + Steuer = brutto): bei einem Steuersatz ist brutto der Endbetrag,
+  // bei mehreren Steuersätzen die Summe der Bruttowerte.
+  if (vatGross.length === 1) add(vatGross[0], 4);
+  if (vatGross.length > 1) add(vatGross.reduce((s, c) => s + c, 0), 6);
   if (given && change && given > change) add(given - change, 5);
   let best = null;
   for (const [c, pts] of score) {
@@ -291,10 +296,12 @@ function findDate(text) {
 
 function findRef(text, profile) {
   if (profile && profile.refLabel) {
-    const esc = profile.refLabel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*');
-    const re = new RegExp(`(?:^|[^a-zäöüß])${esc}\\s*[:#.]?\\s*([A-Z0-9][A-Z0-9/-]{1,29})`, 'gi');
+    // Wort vor einer Nummer, das der gelernten Beschriftung gleicht (ein bis zwei Lesefehler erlaubt).
+    const re = /([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß.-]{1,20})\s*[:#.!]?\s*([A-Z0-9][A-Z0-9/-]{1,29})/g;
     for (const m of text.matchAll(re)) {
-      if (/\d/.test(m[1]) && !REF_EXCLUDE.test(m[0])) return m[1].replace(/[/-]+$/, '');
+      const word = m[1].toLowerCase().replace(/[.:-]+$/, '');
+      if (/\d/.test(m[2]) && Math.abs(word.length - profile.refLabel.length) <= 2
+        && similarity(word, profile.refLabel) >= 0.6 && !REF_EXCLUDE.test(m[0])) return m[2].replace(/[/-]+$/, '');
     }
   }
   for (const re of REF_PATTERNS) {
@@ -334,8 +341,15 @@ export function parseReceiptText(text, biz) {
       && (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 5) || '';
   }
   if (!supplier) {
-    supplier = lines.find((l) => (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 4
-      && !/^(rechnung|beleg|kassa|datum|summe|www|tel)/i.test(l)) || '';
+    // Name aus der Internetadresse, z. B. "musterfirma.at" -> "Musterfirma"
+    const domain = fingerprintsOf(full).find((id) => !id.startsWith('ATU') && !/fiskaltrust|efsta|rksv/.test(id));
+    if (domain) supplier = domain.replace(/\.[a-z]+$/, '').split('-').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join('-');
+  }
+  if (!supplier) {
+    // erste Textzeile, aber keine Branchen-, Adress- oder Formularzeilen
+    supplier = lines.slice(0, 12).find((l) => (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 4
+      && !/^(rechnung|beleg|kassa|datum|summe|www|tel|uid|atu)/i.test(l)
+      && !/(handel|gemüse|gemuese|obst|stra(ss|ß)e|gasse|platz|markt\s*\d|wien|graz|linz|salzburg|filiale|\b\d{4}\b)/i.test(l)) || '';
   }
   supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim()
     .replace(/\b0G\b/g, 'OG').replace(/\bGmbh\b/g, 'GmbH').replace(/\bK6\b/g, 'KG').slice(0, 60);
@@ -362,8 +376,13 @@ const lineLetters = (l) => l.toLowerCase().replace(/[^a-zäöüß\s-]/g, ' ').re
 // Merkmale eines Lieferanten: UID-Nummer (ATU...) und Internetadresse.
 export function fingerprintsOf(text) {
   const ids = new Set();
-  for (const m of text.matchAll(/\bATU\s?(\d{8})\b/gi)) ids.add(`ATU${m[1]}`);
-  for (const m of text.matchAll(/(?:www\.|https?:\/\/(?:[a-z0-9-]+\.)?)([a-z0-9-]{3,}\.(?:at|de|com|eu|net))\b/gi)) ids.add(m[1].toLowerCase());
+  // UID: typische Lesefehler in den Ziffern angleichen (O/0, B/8, I/l/1, S/5, Z/2).
+  const digits = (s) => s.toUpperCase().replace(/O/g, '0').replace(/B/g, '8').replace(/[IL]/g, '1').replace(/S/g, '5').replace(/Z/g, '2');
+  for (const m of text.matchAll(/\bAT[UV]\s?([0-9OBILSZ]{8})\b/gi)) {
+    const d = digits(m[1]);
+    if (/^\d{8}$/.test(d)) ids.add(`ATU${d}`);
+  }
+  for (const m of text.matchAll(/(?:www\.\s?|https?:\/\/(?:[a-z0-9-]+\.)?)([a-z0-9-]{3,}\.(?:at|de|com|eu|net))\b/gi)) ids.add(m[1].toLowerCase());
   return [...ids];
 }
 
