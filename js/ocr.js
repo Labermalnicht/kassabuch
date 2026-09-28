@@ -188,7 +188,8 @@ function loadTesseract() {
   return tesseractLoad;
 }
 
-export async function recognizeOffline(canvas, biz, onProgress) {
+// altCanvas: anders aufbereitetes Bild für einen zweiten Versuch, falls der erste weder Betrag noch Datum liefert.
+export async function recognizeOffline(canvas, biz, onProgress, altCanvas) {
   await loadTesseract();
   progressCb = onProgress;
   if (!workerPromise) {
@@ -203,7 +204,11 @@ export async function recognizeOffline(canvas, biz, onProgress) {
   }
   const worker = await workerPromise;
   const { data } = await worker.recognize(canvas);
-  return parseReceiptText(data.text || '', biz);
+  const first = parseReceiptText(data.text || '', biz);
+  if ((first.amount && first.date) || !altCanvas) return first;
+  const second = parseReceiptText((await worker.recognize(altCanvas)).data.text || '', biz);
+  const filled = (r) => [r.amount, r.date, r.ref, r.supplier].filter(Boolean).length;
+  return filled(second) > filled(first) ? second : first;
 }
 
 // Betrag mit zwei Nachkommastellen. Nicht Teil eines Datums ("18.09.2026"), keiner längeren Zahl und kein Prozentsatz.

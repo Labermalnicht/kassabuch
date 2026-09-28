@@ -289,6 +289,16 @@ input[type="date"] { display: block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
 
+/* ---------- Zuschneiden ---------- */
+.crop-wrap { position: relative; margin: 0 auto 14px; width: fit-content; max-width: 100%; overflow: hidden; border-radius: 8px; touch-action: none; user-select: none; -webkit-user-select: none; }
+.crop-wrap img { display: block; max-width: 100%; max-height: 60dvh; pointer-events: none; }
+.crop-box { position: absolute; border: 2px solid #fff; outline: 2px solid var(--accent); box-shadow: 0 0 0 9999px rgba(0, 0, 0, .5); cursor: move; touch-action: none; }
+.crop-h { position: absolute; width: 30px; height: 30px; border-radius: 50%; background: var(--accent); border: 3px solid #fff; box-shadow: 0 1px 4px rgba(0, 0, 0, .4); }
+.crop-h[data-h="tl"] { left: -16px; top: -16px; cursor: nwse-resize; }
+.crop-h[data-h="tr"] { right: -16px; top: -16px; cursor: nesw-resize; }
+.crop-h[data-h="bl"] { left: -16px; bottom: -16px; cursor: nesw-resize; }
+.crop-h[data-h="br"] { right: -16px; bottom: -16px; cursor: nwse-resize; }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed; left: 50%; transform: translateX(-50%); z-index: 40;

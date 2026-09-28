@@ -5,7 +5,7 @@ import {
   parseAmount, fmtMoney, fmtAmountInput, fmtDate, fmtDay, fmtMonth, shiftMonth,
   withBalances, currentBalance, todayISO, uid,
 } from './ledger.js';
-import { prepareImage } from './image.js';
+import { prepareImage, decodeForCrop, cropToBlob } from './image.js';
 import * as ocr from './ocr.js';
 import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js';
 
@@ -423,6 +423,16 @@ function viewModal() {
     body = salaryBody(m);
     const n = m.rows.filter((r) => r.on && parseAmount(r.amount) > 0).length;
     foot = `<button class="btn primary grow" data-act="salary-save" ${n ? '' : 'disabled'}>${t('salary.book', { n })}</button>`;
+  } else if (m.type === 'crop') {
+    title = t('crop.title') + (m.queuePos ? ` (${m.queuePos})` : '');
+    body = m.preview
+      ? `<p class="hint">${t('crop.hint')}</p>
+<div class="crop-wrap" id="crop-wrap"><img src="${m.preview}" id="crop-img" alt="${esc(t('ocr.photo'))}" draggable="false">
+<div class="crop-box" id="crop-box" style="${cropStyle(m.rect)}"><span class="crop-h" data-h="tl"></span><span class="crop-h" data-h="tr"></span><span class="crop-h" data-h="bl"></span><span class="crop-h" data-h="br"></span></div></div>
+<label class="switch"><input type="checkbox" id="crop-again"><span>${t('crop.again')}</span></label>`
+      : `<div class="ocr run"><span class="spinner"></span><span>${t('crop.loading')}</span></div>`;
+    foot = `<button class="btn" data-act="crop-whole" ${m.preview ? '' : 'disabled'}>${t('crop.whole')}</button>
+      <button class="btn primary grow" data-act="crop-use" ${m.preview ? '' : 'disabled'}>${icon('check')}<span>${t('crop.use')}</span></button>`;
   } else if (m.type === 'bizPick') {
     title = t('biz.title');
     body = `<div class="card list">${S.businesses.map((b) => `<button class="row" data-act="biz-select:${esc(b.id)}"><span class="row-main"><span class="row-title">${esc(b.name)}</span><span class="row-sub">${t('tpl.' + b.template)}</span></span>${b.id === S.biz?.id ? icon('check', 'ok') : ''}</button>`).join('')}</div>`;
@@ -640,18 +650,105 @@ async function processNext() {
   const file = S.queue.shift();
   if (!file) return;
   S.queueDone++;
-  openEntry('receipt');
-  const m = S.modal;
-  if (file.recognized) {
-    m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
-    m.preview = file.preview;
-    applyRecognition(m, file.recognized);
-    m.ocr = { status: 'claude', payment: file.recognized.payment, multi: file.multi };
-    renderModal();
+  if (!file.recognized) {
+    openCrop(file);
     return;
   }
-  m.ocr = { status: 'running', offline: !S.settings.apiKey };
+  // Weiterer von Claude erkannter Beleg desselben Fotos: direkt ins Formular.
+  openEntry('receipt');
+  const m = S.modal;
   m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
+  m.preview = file.preview;
+  applyRecognition(m, file.recognized);
+  m.ocr = { status: 'claude', payment: file.recognized.payment, multi: file.multi };
+  renderModal();
+}
+
+// ---------- Zuschneiden ----------
+
+const cropStyle = (r) => `left:${r.x * 100}%;top:${r.y * 100}%;width:${r.w * 100}%;height:${r.h * 100}%`;
+
+async function openCrop(file) {
+  const token = uid();
+  S.modal = {
+    type: 'crop', token, file, rect: { x: 0.04, y: 0.03, w: 0.92, h: 0.94 }, preview: null,
+    queuePos: S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '',
+  };
+  render();
+  try {
+    const d = await decodeForCrop(file);
+    if (!S.modal || S.modal.token !== token) return;
+    S.modal.src = d.src;
+    S.modal.preview = d.preview;
+    renderModal();
+  } catch {
+    showToast(t('ocr.err.image'), 'err');
+    S.modal = null;
+    render();
+    processNext();
+  }
+}
+
+async function useCrop(whole) {
+  const m = S.modal;
+  if (!m || m.type !== 'crop' || !m.src) return;
+  const again = document.getElementById('crop-again')?.checked;
+  const blob = whole ? m.file : await cropToBlob(m.src, m.rect);
+  if (again) {
+    // Dasselbe Foto danach noch einmal zum Zuschneiden des nächsten Belegs.
+    S.queue.unshift(m.file);
+    S.queueTotal++;
+  }
+  recognizePhoto(blob, m.queuePos);
+}
+
+let cropDrag = null;
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+document.addEventListener('pointerdown', (ev) => {
+  const box = ev.target.closest && ev.target.closest('#crop-box');
+  if (!box || !S.modal || S.modal.type !== 'crop') return;
+  ev.preventDefault();
+  cropDrag = {
+    handle: ev.target.dataset.h || 'move', x0: ev.clientX, y0: ev.clientY,
+    start: { ...S.modal.rect }, img: document.getElementById('crop-img').getBoundingClientRect(),
+  };
+  if (box.setPointerCapture) box.setPointerCapture(ev.pointerId);
+});
+
+document.addEventListener('pointermove', (ev) => {
+  if (!cropDrag || !S.modal || S.modal.type !== 'crop') return;
+  ev.preventDefault();
+  const { img, start, handle } = cropDrag;
+  const dx = (ev.clientX - cropDrag.x0) / img.width;
+  const dy = (ev.clientY - cropDrag.y0) / img.height;
+  const MIN = 0.08;
+  let { x, y, w, h } = start;
+  if (handle === 'move') {
+    x = clamp(x + dx, 0, 1 - w);
+    y = clamp(y + dy, 0, 1 - h);
+  } else {
+    if (handle.includes('l')) { const nx = clamp(x + dx, 0, x + w - MIN); w += x - nx; x = nx; }
+    if (handle.includes('r')) w = clamp(w + dx, MIN, 1 - x);
+    if (handle.includes('t')) { const ny = clamp(y + dy, 0, y + h - MIN); h += y - ny; y = ny; }
+    if (handle.includes('b')) h = clamp(h + dy, MIN, 1 - y);
+  }
+  S.modal.rect = { x, y, w, h };
+  const box = document.getElementById('crop-box');
+  if (box) box.setAttribute('style', cropStyle(S.modal.rect));
+}, { passive: false });
+
+const endDrag = () => { cropDrag = null; };
+document.addEventListener('pointerup', endDrag);
+document.addEventListener('pointercancel', endDrag);
+
+// ---------- Erkennung eines (zugeschnittenen) Fotos ----------
+
+async function recognizePhoto(file, queuePos = '') {
+  openEntry('receipt');
+  const m = S.modal;
+  m.ocr = { status: 'running', offline: !S.settings.apiKey };
+  m.queuePos = queuePos;
   renderModal();
   const token = m.token;
   const alive = () => S.modal && S.modal.token === token;
@@ -696,7 +793,7 @@ async function processNext() {
       res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, (p) => {
         const el = alive() && document.getElementById('ocr-progress');
         if (el) el.textContent = `${Math.round(p * 100)} %`;
-      });
+      }, img.ocrCanvasAlt);
     } catch (err) {
       console.warn('Offline-Erkennung fehlgeschlagen', err);
       if (alive()) { syncModal(); m.ocr = { status: 'error', msg: err.message || t('ocr.failed'), note }; renderModal(); }
@@ -959,11 +1056,13 @@ document.addEventListener('click', async (ev) => {
     case 'edit': openEdit(arg); break;
     case 'salary': openSalary(); break;
     case 'modal-close':
-      if (S.modal && S.modal.kind === 'receipt' && S.queue.length) {
+      if (S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop') && S.queue.length) {
         S.modal = null; render(); processNext();
       } else closeModal();
       break;
     case 'entry-save': saveEntry(); break;
+    case 'crop-use': useCrop(false); break;
+    case 'crop-whole': useCrop(true); break;
     case 'entry-del': deleteEntry(); break;
     case 'dir': syncModal(); S.modal.data.dir = arg; renderModal(); break;
     case 'tips-add': syncModal(); S.modal.data.parts.push(''); renderModal(); document.querySelector(`[data-part="${S.modal.data.parts.length - 1}"]`)?.focus(); break;
