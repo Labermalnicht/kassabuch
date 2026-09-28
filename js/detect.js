@@ -100,7 +100,7 @@ function medianRange(arr, a, b) {
 // gleich lang: Ober- oder Unterkante springt dort dauerhaft, wo der eine Beleg aufhört. Ein einzelner Beleg ist
 // überall gleich lang. Geschnitten wird an jeder deutlichen, bleibenden Stufe. Schmale Streifen am Rand
 // (Papierstapel, Mappe, Licht) fallen weg, schmale Streifen dazwischen kommen zum ähnlicheren Nachbarn.
-function splitReceipts(xs, ys, w, h, ink, inner) {
+function splitReceipts(xs, ys, w, h, ink, inner, mask) {
   const n = xs.length;
   const sx = Int32Array.from(xs).sort();
   const sy = Int32Array.from(ys).sort();
@@ -132,6 +132,14 @@ function splitReceipts(xs, ys, w, h, ink, inner) {
     }
     return c > 10 ? s / c : 0;
   };
+  // Wie vollflächig ein Bereich zur Fläche gehört: ein überstehender Bon ist ein volles Rechteck,
+  // eine schräg anliegende Mappe oder ein Lichtfleck nicht.
+  const fillIn = (a, b, ya, yb) => {
+    let s = 0;
+    let c = 0;
+    for (let y = Math.max(0, Math.round(ya)); y < Math.round(yb); y++) for (let x = a; x < b; x++) { s += mask[y * w + x]; c++; }
+    return c ? s / c : 0;
+  };
   const stepAt = (c) => {
     const la = Math.max(x0, c - WIN);
     const rb = Math.min(x1 + 1, c + 1 + WIN);
@@ -145,11 +153,12 @@ function splitReceipts(xs, ys, w, h, ink, inner) {
       if (isTop ? Math.min(l, r) < 0.03 * h : Math.max(l, r) > 0.97 * h - 1) continue;
       // Die längere Seite steht über: oben die mit der kleineren Oberkante, unten die mit der größeren Unterkante.
       const leftLonger = isTop ? l < r : l > r;
-      // Schrift im überstehenden Teil: insgesamt (breites Fenster) und auch direkt an der Schnittstelle.
+      // Der überstehende Teil muss ein volles Stück Papier mit Schrift sein (insgesamt und nahe der Schnittstelle).
+      // Die Schwellen sind niedrig, weil Live-Kamerabilder oft leicht unscharf sind.
       const span = (k) => (leftLonger ? [Math.max(x0, c - k * WIN), c] : [c + 1, Math.min(x1 + 1, c + 1 + k * WIN)]);
-      const inkNear = inkIn(...span(2), Math.min(l, r), Math.max(l, r));
-      const inkWide = inkIn(...span(4), Math.min(l, r), Math.max(l, r));
-      if (inkWide >= 0.02 && inkNear >= 0.005) s += d;
+      const ya = Math.min(l, r);
+      const yb = Math.max(l, r);
+      if (fillIn(...span(4), ya, yb) >= 0.88 && inkIn(...span(4), ya, yb) >= 0.012 && inkIn(...span(2), ya, yb) >= 0.004) s += d;
     }
     return s / height;
   };
@@ -158,7 +167,7 @@ function splitReceipts(xs, ys, w, h, ink, inner) {
   // Örtliche Spitzen über der Schwelle, mindestens WIN Spalten auseinander.
   const cuts = [];
   for (let c = x0 + 3; c <= x1 - 3; c++) {
-    if (steps[c] < 0.08) continue;
+    if (steps[c] < 0.12) continue;
     let peak = true;
     for (let d = -WIN; d <= WIN && peak; d++) {
       const v = steps[c + d] || 0;
@@ -167,7 +176,8 @@ function splitReceipts(xs, ys, w, h, ink, inner) {
     if (peak) cuts.push(c);
   }
   if (!cuts.length) return [[xs, ys]];
-  // Abschnitte bilden; schmale Abschnitte am Rand verwerfen, innen dem Nachbarn mit ähnlicheren Kanten zuschlagen.
+  // Abschnitte bilden. Schmale Abschnitte innen kommen zum Nachbarn mit ähnlicheren Kanten; am Rand ebenso, wenn sie
+  // innerhalb der Höhe des Nachbarn liegen (Randstück desselben Bons), sonst fallen sie weg (Papierstapel, Mappe).
   const bounds = [x0, ...cuts, x1 + 1];
   const segs = bounds.slice(0, -1).map((a, i) => ({ a, b: bounds[i + 1] }));
   const minW = Math.max(6, 0.12 * height);
@@ -175,8 +185,15 @@ function splitReceipts(xs, ys, w, h, ink, inner) {
   for (;;) {
     const i = segs.findIndex((sg) => sg.b - sg.a < minW);
     if (i < 0 || segs.length === 1) break;
-    if (i === 0 || i === segs.length - 1) { segs.splice(i, 1); continue; }
     const [t, bt] = edgesOf(segs[i]);
+    if (i === 0 || i === segs.length - 1) {
+      const nb = segs[i === 0 ? 1 : i - 1];
+      const [nt, nbt] = edgesOf(nb);
+      const tol = 0.1 * height;
+      if (t >= nt - tol && bt <= nbt + tol) { nb.a = Math.min(nb.a, segs[i].a); nb.b = Math.max(nb.b, segs[i].b); }
+      segs.splice(i, 1);
+      continue;
+    }
     const diff = (sg) => { const [t2, b2] = edgesOf(sg); return Math.abs(t - t2) + Math.abs(bt - b2); };
     const j = diff(segs[i - 1]) <= diff(segs[i + 1]) ? i - 1 : i + 1;
     segs[j] = { a: Math.min(segs[i].a, segs[j].a), b: Math.max(segs[i].b, segs[j].b) };
@@ -236,10 +253,10 @@ export function detectReceipts(src) {
   const er = boxBlur(Float32Array.from(mask), w, h, ER);
   const core = new Uint8Array(N);
   for (let i = 0; i < N; i++) core[i] = er[i] > 0.97 ? 1 : 0;
-  // Schrift: dunkler als die Umgebung.
+  // Schrift: dunkler als die Umgebung (Schwelle so, dass auch leicht unscharfe Kamerabilder reichen).
   const Lb = boxBlur(L, w, h, 6);
   const ink = new Uint8Array(N);
-  for (let i = 0; i < N; i++) ink[i] = L[i] < Math.max(60, Lb[i] - 35) ? 1 : 0;
+  for (let i = 0; i < N; i++) ink[i] = L[i] < Math.max(60, Lb[i] - 25) ? 1 : 0;
 
   const meanIn = (arr, x0, y0, x1, y1) => {
     let s = 0;
@@ -252,7 +269,7 @@ export function detectReceipts(src) {
     if (pts.length / N < 0.02) continue;
     const xsAll = Int32Array.from(pts, (p) => p % w);
     const ysAll = Int32Array.from(pts, (p) => Math.floor(p / w));
-    const parts = splitReceipts(xsAll, ysAll, w, h, ink, core);
+    const parts = splitReceipts(xsAll, ysAll, w, h, ink, core, mask);
     const kept = [];
     for (const [pxs, pys] of parts) {
       if (pxs.length / N < 0.02) continue;

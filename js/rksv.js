@@ -35,50 +35,75 @@ export function loadQrLib() {
   return libPromise;
 }
 
-function canvasOf(src, maxSide, region = { x: 0, y: 0, w: 1, h: 1 }) {
+// Ausschnitt region (Anteile) als Canvas; so skaliert, dass die Breite etwa targetW Pixel hat
+// (kleine Codes werden dabei vergrößert, das hilft jsQR deutlich), höchstens maxSide Pixel an der längeren Seite.
+function canvasOf(src, targetW, region = { x: 0, y: 0, w: 1, h: 1 }, maxSide = 2000) {
   const sw = src.width * region.w;
   const sh = src.height * region.h;
-  const scale = Math.min(1.5, maxSide / Math.max(sw, sh));
+  const scale = Math.min(3, targetW / sw, maxSide / Math.max(sw, sh));
   const c = document.createElement('canvas');
   c.width = Math.max(1, Math.round(sw * scale));
   c.height = Math.max(1, Math.round(sh * scale));
   const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(src, src.width * region.x, src.height * region.y, sw, sh, 0, 0, c.width, c.height);
   return c;
 }
 
 /**
+ * Liest mit jsQR alle Codes eines Bildes nacheinander: jsQR meldet nur einen Code, darum wird jeder gefundene
+ * Code übermalt und weitergesucht (z. B. steht unter dem RKSV-Code oft ein Feedback-QR-Code).
+ * Liefert den ersten RKSV-Inhalt oder null; onText(text) für jeden gelesenen Code.
+ */
+export function jsqrRksv(jsQR, img, onText) {
+  for (let k = 0; k < 3; k++) {
+    const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
+    if (!code || !code.data) return null;
+    if (onText) onText(code.data);
+    const hit = parseRksv(code.data);
+    if (hit) return hit;
+    const L = code.location;
+    const xs = [L.topLeftCorner.x, L.topRightCorner.x, L.bottomLeftCorner.x, L.bottomRightCorner.x];
+    const ys = [L.topLeftCorner.y, L.topRightCorner.y, L.bottomLeftCorner.y, L.bottomRightCorner.y];
+    const m = 0.15 * (Math.max(...xs) - Math.min(...xs));
+    const x0 = Math.max(0, Math.floor(Math.min(...xs) - m));
+    const x1 = Math.min(img.width, Math.ceil(Math.max(...xs) + m));
+    const y0 = Math.max(0, Math.floor(Math.min(...ys) - m));
+    const y1 = Math.min(img.height, Math.ceil(Math.max(...ys) + m));
+    for (let y = y0; y < y1; y++) img.data.fill(255, (y * img.width + x0) * 4, (y * img.width + x1) * 4);
+  }
+  return null;
+}
+
+// Überlappende waagrechte Streifen, damit kein Code an einer Streifengrenze zerschnitten wird.
+function strips(h) {
+  const out = [];
+  for (let y = 0; y + h <= 1.001; y += h / 2) out.push({ x: 0, y: Math.min(y, 1 - h), w: 1, h });
+  return out;
+}
+
+/**
  * Sucht auf dem Bild (ImageBitmap/Canvas) QR-Codes und liefert den ersten RKSV-Inhalt oder null.
- * Ein Beleg kann mehrere QR-Codes haben (z. B. Feedback-Link); darum werden auch Bildausschnitte abgesucht.
+ * Ein Beleg kann mehrere QR-Codes haben (z. B. Feedback-Link); darum werden auch vergrößerte Ausschnitte abgesucht.
  */
 export async function scanRksv(src) {
-  const found = [];
-  // 1. Eingebauter Barcode-Leser (Android/Chrome), schnell und robust
+  // 1. Eingebauter Barcode-Leser (Android/Chrome), schnell und robust, liefert alle Codes
   if ('BarcodeDetector' in window) {
     try {
       const det = new window.BarcodeDetector({ formats: ['qr_code'] });
-      for (const code of await det.detect(src)) found.push(code.rawValue);
-      const hit = found.map(parseRksv).find(Boolean);
+      const hit = (await det.detect(src)).map((code) => parseRksv(code.rawValue)).find(Boolean);
       if (hit) return hit;
     } catch { /* nicht unterstützt */ }
   }
-  // 2. jsQR über das ganze Bild und über Ausschnitte (Hälften, Drittel), damit auch kleine oder zweite Codes gefunden werden
+  // 2. jsQR über das ganze Bild und über überlappende, vergrößerte Streifen (Hälften, Drittel, Viertel)
   let jsQR;
   try { jsQR = await loadQrLib(); } catch { return null; }
-  const regions = [
-    { x: 0, y: 0, w: 1, h: 1 },
-    { x: 0, y: 0.5, w: 1, h: 0.5 }, { x: 0, y: 0, w: 1, h: 0.5 },
-    { x: 0, y: 0.66, w: 1, h: 0.34 }, { x: 0, y: 0.33, w: 1, h: 0.34 }, { x: 0, y: 0, w: 1, h: 0.34 },
-  ];
+  const regions = [{ x: 0, y: 0, w: 1, h: 1 }, ...strips(0.5), ...strips(1 / 3), ...strips(0.25)];
   for (const r of regions) {
-    for (const size of [1400, 900]) {
-      const c = canvasOf(src, size, r);
-      const img = c.getContext('2d').getImageData(0, 0, c.width, c.height);
-      const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
-      if (code && code.data) {
-        const hit = parseRksv(code.data);
-        if (hit) return hit;
-      }
+    for (const targetW of [1100, 800]) {
+      const c = canvasOf(src, targetW, r);
+      const hit = jsqrRksv(jsQR, c.getContext('2d').getImageData(0, 0, c.width, c.height));
+      if (hit) return hit;
     }
   }
   return null;

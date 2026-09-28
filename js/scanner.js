@@ -1,7 +1,8 @@
 // Live-Scanner: Kamera läuft als Videobild, mehrmals pro Sekunde wird nach dem RKSV-QR-Code gesucht.
-// Android/Chrome: eingebauter BarcodeDetector. iPhone/Safari: jsQR auf einem verkleinerten Einzelbild.
+// Android/Chrome: eingebauter BarcodeDetector. iPhone/Safari: jsQR, abwechselnd auf dem ganzen Bild und auf
+// vergrößerten Bildstreifen, weil der Code auf einem ganzen Bon im Bild sonst zu klein ist.
 // Zusätzlich wird etwa zweimal pro Sekunde nach Kassenbons gesucht: Liegt ein Bon ruhig im Bild, wird er übernommen.
-import { parseRksv, loadQrLib } from './rksv.js';
+import { parseRksv, loadQrLib, jsqrRksv } from './rksv.js';
 import { detectReceipts } from './detect.js';
 
 let stream = null;
@@ -9,14 +10,20 @@ let timer = null;
 let video = null;
 let detector = null;
 let busy = false;
+let qrTurn = 0;
 const work = document.createElement('canvas');
 const detWork = document.createElement('canvas');
 const DETECT_EVERY = 450; // ms zwischen zwei Bonsuchen
-const STABLE_HITS = 3; // so oft hintereinander an derselben Stelle, dann gilt der Bon als ruhig gehalten
+const STABLE_HITS = 3; // so oft hintereinander gleich viele Bons an derselben Stelle, dann gilt das Bild als ruhig
 let lastDetect = 0;
-let track = null; // { box, hits } des aktuell verfolgten Bons
+let track = null; // { box, n, hits } des aktuell verfolgten Bons (n = Anzahl der Bons im Bild)
 // Zuletzt übernommener Bon: erst wieder auslösen, wenn er aus dem Bild war oder sich deutlich bewegt hat.
 let blocked = null;
+// Abwechselnd abgesuchte Bildbereiche für jsQR: ganzes Bild, dann überlappende Hälften und Drittel.
+const QR_REGIONS = [
+  { y: 0, h: 1 }, { y: 0, h: 0.5 }, { y: 0.25, h: 0.5 }, { y: 0.5, h: 0.5 },
+  { y: 0, h: 1 }, { y: 0.33, h: 0.34 }, { y: 0.66, h: 0.34 }, { y: 0, h: 0.34 },
+];
 
 const iou = (a, b) => {
   const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
@@ -24,6 +31,7 @@ const iou = (a, b) => {
   const i = ix * iy;
   return i / (a.w * a.h + b.w * b.h - i);
 };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export const scannerActive = () => !!stream;
 
@@ -35,13 +43,49 @@ export function attachScanner(videoEl) {
   video.play().catch(() => {});
 }
 
-// Aktuelles Kamerabild in voller Auflösung (für das Auslesen des Lieferanten).
+// Aktuelles Kamerabild in voller Auflösung.
 export function grabFrame() {
   const c = document.createElement('canvas');
   c.width = video ? video.videoWidth : 0;
   c.height = video ? video.videoHeight : 0;
   if (c.width) c.getContext('2d').drawImage(video, 0, 0);
   return c;
+}
+
+// Schärfe eines Bildausschnitts: mittlere quadrierte Kantenstärke (Laplace) auf einer verkleinerten Graustufe.
+function sharpness(frame, box) {
+  const W = 320;
+  const sw = frame.width * box.w;
+  const sh = frame.height * box.h;
+  const H = Math.max(8, Math.round((W * sh) / sw));
+  const c = document.createElement('canvas');
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(frame, frame.width * box.x, frame.height * box.y, sw, sh, 0, 0, W, H);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  const g = (x, y) => { const i = (y * W + x) * 4; return 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; };
+  let s = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const l = 4 * g(x, y) - g(x - 1, y) - g(x + 1, y) - g(x, y - 1) - g(x, y + 1);
+      s += l * l;
+    }
+  }
+  return s / ((W - 2) * (H - 2));
+}
+
+// Mehrere Bilder kurz hintereinander, das schärfste gewinnt (weniger Verwacklung für die Texterkennung).
+async function sharpestFrame(box) {
+  let best = null;
+  for (let k = 0; k < 3 && video; k++) {
+    if (k) await wait(120);
+    if (!video) break;
+    const f = grabFrame();
+    const s = sharpness(f, box);
+    if (!best || s > best.s) best = { f, s };
+  }
+  return best ? best.f : grabFrame();
 }
 
 export function stopScanner() {
@@ -55,7 +99,7 @@ export function stopScanner() {
   track = null;
 }
 
-// Bonsuche auf einem verkleinerten Kamerabild. Liefert die Bons und, sobald einer ruhig liegt, true.
+// Bonsuche auf einem verkleinerten Kamerabild. Liefert die Bons, sobald das Bild ruhig ist, sonst null.
 function detectStep(onBoxes) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
@@ -70,19 +114,35 @@ function detectStep(onBoxes) {
   if (!main || blocked) {
     track = null;
     if (onBoxes) onBoxes(boxes, 0);
-    return false;
+    return null;
   }
-  track = track && iou(track.box, main) >= 0.8 ? { box: main, hits: track.hits + 1 } : { box: main, hits: 1 };
+  // Ruhig heißt: gleich viele Bons und der größte an derselben Stelle.
+  const same = track && track.n === boxes.length && iou(track.box, main) >= 0.8;
+  track = { box: main, n: boxes.length, hits: same ? track.hits + 1 : 1 };
   if (onBoxes) onBoxes(boxes, track.hits / STABLE_HITS);
-  if (track.hits < STABLE_HITS) return false;
+  if (track.hits < STABLE_HITS) return null;
   blocked = main;
-  return true;
+  return boxes;
+}
+
+// jsQR auf dem nächsten Bildbereich der Reihe (vergrößert, damit auch kleine Codes lesbar sind).
+function jsqrTick(jsQR, onText) {
+  const r = QR_REGIONS[qrTurn++ % QR_REGIONS.length];
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const sh = vh * r.h;
+  const sc = Math.min(2, (r.h === 1 ? 960 : 1200) / Math.max(vw, sh));
+  work.width = Math.round(vw * sc);
+  work.height = Math.round(sh * sc);
+  const ctx = work.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, vh * r.y, vw, sh, 0, 0, work.width, work.height);
+  return jsqrRksv(jsQR, ctx.getImageData(0, 0, work.width, work.height), onText);
 }
 
 /**
  * Startet Kamera und Suche. onRksv(inhalt, bild) wird beim ersten gültigen RKSV-Code aufgerufen,
  * onOther() bei anderen QR-Codes (z. B. Feedback-Links), onError(fehler) wenn die Kamera nicht verfügbar ist.
- * onReceipt(bild) wird aufgerufen, wenn ein Bon ohne lesbaren Code ruhig im Bild liegt; onBoxes(bons, fortschritt)
+ * onReceipt(bild, bons) wird aufgerufen, wenn Bons ohne lesbaren Code ruhig im Bild liegen; onBoxes(bons, fortschritt)
  * nach jeder Bonsuche für die Anzeige. fresh: neue Scan-Runde, ein zuvor übernommener Bon zählt wieder.
  */
 export async function startScanner(videoEl, { onRksv, onOther, onError, stillWanted, onReceipt, onBoxes, fresh }) {
@@ -91,8 +151,9 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
   lastDetect = Date.now() + 600; // erste Bonsuche erst, wenn die Kamera scharf gestellt hat
   let s;
   try {
+    // Möglichst hohe Auflösung: ganze Bons im Bild brauchen viele Pixel für Schrift und QR-Code.
     s = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } },
       audio: false,
     });
   } catch (e) {
@@ -124,34 +185,32 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
     if (!stream || busy || !video || video.readyState < 2) return;
     busy = true;
     try {
-      let texts = [];
+      const texts = [];
+      let q = null;
       if (detector) {
-        texts = (await detector.detect(video)).map((c) => c.rawValue);
-      } else {
-        const vw = video.videoWidth;
-        const vh = video.videoHeight;
-        const sc = Math.min(1, 960 / Math.max(vw, vh));
-        work.width = Math.round(vw * sc);
-        work.height = Math.round(vh * sc);
-        const ctx = work.getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(video, 0, 0, work.width, work.height);
-        const img = ctx.getImageData(0, 0, work.width, work.height);
-        const code = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' });
-        if (code && code.data) texts = [code.data];
-      }
-      for (const txt of texts) {
-        const q = parseRksv(txt);
-        if (q) {
-          // Dieser Bon ist über seinen Code erledigt (oder schon erfasst): nicht zusätzlich als Foto übernehmen.
-          if (onReceipt) { detectStep(null); blocked = (track && track.box) || blocked; track = null; }
-          onRksv(q, grabFrame());
-          return;
+        for (const c of await detector.detect(video)) {
+          texts.push(c.rawValue);
+          q = q || parseRksv(c.rawValue);
         }
+      } else {
+        q = jsqrTick(jsQR, (txt) => texts.push(txt));
+      }
+      if (q) {
+        // Dieser Bon ist über seinen Code erledigt (oder schon erfasst): nicht zusätzlich als Foto übernehmen.
+        if (onReceipt) { detectStep(null); blocked = (track && track.box) || blocked; track = null; }
+        onRksv(q, grabFrame());
+        return;
       }
       if (texts.length && onOther) onOther();
       if (onReceipt && Date.now() - lastDetect >= DETECT_EVERY) {
         lastDetect = Date.now();
-        if (detectStep(onBoxes)) { onReceipt(grabFrame()); return; }
+        const boxes = detectStep(onBoxes);
+        if (boxes) {
+          const main = boxes.reduce((b, x) => (x.w * x.h > b.w * b.h ? x : b));
+          const frame = await sharpestFrame(main);
+          if (stream) onReceipt(frame, boxes);
+          return;
+        }
       }
     } catch (e) {
       console.warn('Scan', e);

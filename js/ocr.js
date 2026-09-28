@@ -223,6 +223,8 @@ const CHANGE = /(r(ü|ue|u)ckgeld|restgeld|retour|wechselgeld|zur(ü|ue)ck)/i;
 const SKIP = /(r(ü|ue|u)ckgeld|restgeld|retour|wechselgeld|zur(ü|ue)ck|ersparnis|sparen|rabatt|punkte|pfand|zw-?summe|zwischensumme|zw\.\s*summe|subtotal|netto|mwst-?satz|trinkgeld)/i;
 // Eindeutige Endbeträge zählen stärker als ein einfaches "Summe".
 const FINAL_TOTAL = /(zu\s*(be)?zahlen|endsumme|endbetrag|gesamtbetrag|gesamtsumme|rechnungsbetrag|zahl(ungs)?betrag)/i;
+// Steuerzeile, z. B. "20% MwSt von 17,06 = 3,41" oder "USt 10 %": ihre Beträge sind nie der Endbetrag.
+const VAT_LINE = /(mwst|mw\.?\s?st|ust\b|u\.st|steuer|\d\s?%)/i;
 
 // Belegnummer, nach Verlässlichkeit geordnet. Die "Beleg-Nr." des Kartenterminals und die
 // RKSV-Beleg-Nr. (Signaturzähler) kommen zuletzt bzw. gar nicht in Frage.
@@ -264,7 +266,9 @@ function findTotal(lines, profile) {
     if (SKIP.test(l)) return;
     a.forEach((c) => add(c, 1));
     if (STRONG_TOTAL.test(l)) {
-      const own = a.length ? a : amountsIn(lines[i + 1] || '');
+      // Ohne eigenen Betrag gilt die Folgezeile, aber nicht, wenn dort die Steuer steht ("Betrag dankend erhalten").
+      const next = lines[i + 1] || '';
+      const own = a.length ? a : VAT_LINE.test(next) ? [] : amountsIn(next);
       if (own.length) add(own[own.length - 1], FINAL_TOTAL.test(l) ? 7 : 5);
     } else if (PAID.test(l) && a.length) {
       add(a[a.length - 1], 2);
@@ -273,7 +277,9 @@ function findTotal(lines, profile) {
       const own = a.length ? a : amountsIn(lines[i + 1] || '');
       if (own.length) add(own[own.length - 1], 8);
     }
-    if (a.length >= 3) {
+    if (a.length === 2 && VAT_LINE.test(l) && /\bvon\b/i.test(l)) {
+      vatGross.push(a[0] + a[1]); // "MwSt von netto = Steuer"
+    } else if (a.length >= 3) {
       const [x, y, z] = a.slice(-3);
       if (Math.abs(x + y - z) <= 1) vatGross.push(z); // netto, Steuer, brutto
       else if (Math.abs(y + z - x) <= 1) vatGross.push(x); // brutto, netto, Steuer
@@ -354,7 +360,7 @@ export function parseReceiptText(text, biz) {
   }
   if (!supplier) {
     const chain = lines.find((l) => KNOWN_CHAINS.some((re) => re.test(l)));
-    if (chain) supplier = chain;
+    if (chain) supplier = (suggest(biz, chain) || {}).name || chain;
   }
   if (!supplier) {
     // Firmenzeile mit Rechtsform, z. B. "... OG", "... GmbH", "... KG"

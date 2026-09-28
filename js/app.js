@@ -722,7 +722,7 @@ async function openCrop(file, index = 0) {
     S.modal.src = d.src;
     S.modal.preview = d.preview;
     // Belege automatisch suchen und den Rahmen auf den (nächsten) gefundenen Beleg setzen.
-    try { S.modal.found = detectReceipts(d.src); } catch (e) { console.warn('Belegsuche', e); S.modal.found = []; }
+    try { S.modal.found = file.found || detectReceipts(d.src); } catch (e) { console.warn('Belegsuche', e); S.modal.found = []; }
     const f = S.modal.found;
     if (f.length) {
       S.modal.index = Math.min(index, f.length - 1);
@@ -1052,12 +1052,14 @@ async function openScanner(count = 0, fresh = false) {
       holding = progress > 0;
     },
     // Bon liegt ruhig im Bild, aber ohne lesbaren Code: Foto übernehmen und direkt zum Zuschneiden.
-    onReceipt: (frame) => {
+    onReceipt: (frame, boxes) => {
       if (!alive()) return;
       stopScanner();
       if (navigator.vibrate) navigator.vibrate(60);
       frame.toBlob((blob) => {
         if (!alive() || !blob) return;
+        // Die im Live-Bild ruhig erkannten Rahmen gelten auch im Zuschneiden (keine neue, evtl. abweichende Suche).
+        blob.found = boxes;
         S.queue = [];
         S.queueTotal = 1;
         S.queueDone = 0;
