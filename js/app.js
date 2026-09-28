@@ -6,6 +6,7 @@ import {
   withBalances, currentBalance, todayISO, uid,
 } from './ledger.js';
 import { prepareImage, decodeForCrop, cropToBlob } from './image.js';
+import { detectReceipts } from './detect.js';
 import * as ocr from './ocr.js';
 import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js';
 
@@ -425,11 +426,18 @@ function viewModal() {
     foot = `<button class="btn primary grow" data-act="salary-save" ${n ? '' : 'disabled'}>${t('salary.book', { n })}</button>`;
   } else if (m.type === 'crop') {
     title = t('crop.title') + (m.queuePos ? ` (${m.queuePos})` : '');
+    const f = m.found || [];
+    const detectHint = !f.length ? banner('warn', t('crop.none'))
+      : f.length === 1 ? banner('ok', t('crop.found1'))
+        : banner('ok', t('crop.foundN', { n: f.length, i: m.index + 1 }));
+    // Weitere erkannte Belege als gestrichelte, nummerierte Rahmen zum Antippen.
+    const sugs = f.map((r, i) => (i === m.index ? '' : `<button type="button" class="crop-sug" data-act="crop-pick:${i}" style="${cropStyle(r)}" aria-label="${esc(t('crop.pick', { i: i + 1 }))}"><span>${i + 1}</span></button>`)).join('');
     body = m.preview
-      ? `<p class="hint">${t('crop.hint')}</p>
+      ? `${detectHint}
 <div class="crop-wrap" id="crop-wrap"><img src="${m.preview}" id="crop-img" alt="${esc(t('ocr.photo'))}" draggable="false">
-<div class="crop-box" id="crop-box" style="${cropStyle(m.rect)}"><span class="crop-h" data-h="tl"></span><span class="crop-h" data-h="tr"></span><span class="crop-h" data-h="bl"></span><span class="crop-h" data-h="br"></span></div></div>
-<label class="switch"><input type="checkbox" id="crop-again"><span>${t('crop.again')}</span></label>`
+<div class="crop-box" id="crop-box" style="${cropStyle(m.rect)}">${f.length > 1 ? `<span class="crop-num">${m.index + 1}</span>` : ''}<span class="crop-h" data-h="tl"></span><span class="crop-h" data-h="tr"></span><span class="crop-h" data-h="bl"></span><span class="crop-h" data-h="br"></span></div>${sugs}</div>
+<p class="hint">${t('crop.hint')}</p>
+<label class="switch"><input type="checkbox" id="crop-again" ${m.again ? 'checked' : ''}><span>${t('crop.again')}</span></label>`
       : `<div class="ocr run"><span class="spinner"></span><span>${t('crop.loading')}</span></div>`;
     foot = `<button class="btn" data-act="crop-whole" ${m.preview ? '' : 'disabled'}>${t('crop.whole')}</button>
       <button class="btn primary grow" data-act="crop-use" ${m.preview ? '' : 'disabled'}>${icon('check')}<span>${t('crop.use')}</span></button>`;
@@ -651,7 +659,8 @@ async function processNext() {
   if (!file) return;
   S.queueDone++;
   if (!file.recognized) {
-    openCrop(file);
+    if (file.again) openCrop(file.file, file.index);
+    else openCrop(file, 0);
     return;
   }
   // Weiterer von Claude erkannter Beleg desselben Fotos: direkt ins Formular.
@@ -668,10 +677,10 @@ async function processNext() {
 
 const cropStyle = (r) => `left:${r.x * 100}%;top:${r.y * 100}%;width:${r.w * 100}%;height:${r.h * 100}%`;
 
-async function openCrop(file) {
+async function openCrop(file, index = 0) {
   const token = uid();
   S.modal = {
-    type: 'crop', token, file, rect: { x: 0.04, y: 0.03, w: 0.92, h: 0.94 }, preview: null,
+    type: 'crop', token, file, rect: { x: 0.04, y: 0.03, w: 0.92, h: 0.94 }, preview: null, found: [], index,
     queuePos: S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '',
   };
   render();
@@ -680,6 +689,14 @@ async function openCrop(file) {
     if (!S.modal || S.modal.token !== token) return;
     S.modal.src = d.src;
     S.modal.preview = d.preview;
+    // Belege automatisch suchen und den Rahmen auf den (nächsten) gefundenen Beleg setzen.
+    try { S.modal.found = detectReceipts(d.src); } catch (e) { console.warn('Belegsuche', e); S.modal.found = []; }
+    const f = S.modal.found;
+    if (f.length) {
+      S.modal.index = Math.min(index, f.length - 1);
+      S.modal.rect = { ...f[S.modal.index] };
+      S.modal.again = S.modal.index < f.length - 1;
+    }
     renderModal();
   } catch {
     showToast(t('ocr.err.image'), 'err');
@@ -694,9 +711,9 @@ async function useCrop(whole) {
   if (!m || m.type !== 'crop' || !m.src) return;
   const again = document.getElementById('crop-again')?.checked;
   const blob = whole ? m.file : await cropToBlob(m.src, m.rect);
-  if (again) {
-    // Dasselbe Foto danach noch einmal zum Zuschneiden des nächsten Belegs.
-    S.queue.unshift(m.file);
+  if (again && !whole) {
+    // Dasselbe Foto danach noch einmal, Rahmen dann auf dem nächsten erkannten Beleg.
+    S.queue.unshift({ again: true, file: m.file, index: m.index + 1 });
     S.queueTotal++;
   }
   recognizePhoto(blob, m.queuePos);
@@ -1062,6 +1079,15 @@ document.addEventListener('click', async (ev) => {
       break;
     case 'entry-save': saveEntry(); break;
     case 'crop-use': useCrop(false); break;
+    case 'crop-pick': {
+      const m = S.modal;
+      if (!m || m.type !== 'crop' || !m.found[Number(arg)]) break;
+      m.again = document.getElementById('crop-again')?.checked;
+      m.index = Number(arg);
+      m.rect = { ...m.found[m.index] };
+      renderModal();
+      break;
+    }
     case 'crop-whole': useCrop(true); break;
     case 'entry-del': deleteEntry(); break;
     case 'dir': syncModal(); S.modal.data.dir = arg; renderModal(); break;
