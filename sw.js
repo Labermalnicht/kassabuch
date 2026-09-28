@@ -1,5 +1,5 @@
 // Offline-Fähigkeit: Die App-Dateien werden zwischengespeichert und im Hintergrund aktualisiert.
-const CACHE = 'kassabuch-v19';
+const CACHE = 'kassabuch-v20';
 const FILES = [
   './',
   './index.html',

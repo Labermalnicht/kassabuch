@@ -89,6 +89,107 @@ function components(mask, w, h) {
   return out;
 }
 
+function medianRange(arr, a, b) {
+  const v = [];
+  for (let x = a; x < b; x++) if (!Number.isNaN(arr[x])) v.push(arr[x]);
+  v.sort((p, q) => p - q);
+  return v.length ? v[Math.floor(v.length / 2)] : NaN;
+}
+
+// Teilt eine Fläche, wenn darin mehrere Belege nebeneinander liegen (auch überlappend). Zwei Belege sind fast nie
+// gleich lang: Ober- oder Unterkante springt dort dauerhaft, wo der eine Beleg aufhört. Ein einzelner Beleg ist
+// überall gleich lang. Geschnitten wird an jeder deutlichen, bleibenden Stufe. Schmale Streifen am Rand
+// (Papierstapel, Mappe, Licht) fallen weg, schmale Streifen dazwischen kommen zum ähnlicheren Nachbarn.
+function splitReceipts(xs, ys, w, h, ink, inner) {
+  const n = xs.length;
+  const sx = Int32Array.from(xs).sort();
+  const sy = Int32Array.from(ys).sort();
+  const x0 = percentile(sx, 1);
+  const x1 = percentile(sx, 99);
+  const height = percentile(sy, 99) - percentile(sy, 1) + 1;
+  if (n < 50 || (x1 - x0) / height <= 0.4) return [[xs, ys]];
+
+  const colYs = Array.from({ length: w }, () => []);
+  for (let i = 0; i < n; i++) colYs[xs[i]].push(ys[i]);
+  const top = new Float32Array(w).fill(NaN);
+  const bottom = new Float32Array(w).fill(NaN);
+  for (let x = x0; x <= x1; x++) {
+    if (colYs[x].length > 5) {
+      const c = Float32Array.from(colYs[x]).sort();
+      top[x] = percentile(c, 3);
+      bottom[x] = percentile(c, 97);
+    }
+  }
+  // Stufe je Spalte: Median der Kanten links gegen rechts, je über ein Fenster von WIN Spalten.
+  // Zählt nur, wenn der überstehende Teil Schrift trägt (sonst ist es Mappe, Papierrand oder Licht).
+  const WIN = 8;
+  // Schriftanteil nur im Inneren des Papiers (dunkler Tisch und Kanten daneben zählen nicht).
+  const inkIn = (a, b, ya, yb) => {
+    let s = 0;
+    let c = 0;
+    for (let y = Math.max(0, Math.round(ya)); y < Math.round(yb); y++) {
+      for (let x = a; x < b; x++) { const i = y * w + x; if (inner[i]) { s += ink[i]; c++; } }
+    }
+    return c > 10 ? s / c : 0;
+  };
+  const stepAt = (c) => {
+    const la = Math.max(x0, c - WIN);
+    const rb = Math.min(x1 + 1, c + 1 + WIN);
+    let s = 0;
+    for (const [arr, isTop] of [[top, true], [bottom, false]]) {
+      const l = medianRange(arr, la, c);
+      const r = medianRange(arr, c + 1, rb);
+      const d = Math.abs(l - r);
+      if (Number.isNaN(d) || d / height < 0.04) continue;
+      // Reicht der überstehende Teil bis an den Bildrand, ist es Hintergrund (Mappe, Papierstapel), kein Beleg.
+      if (isTop ? Math.min(l, r) < 0.03 * h : Math.max(l, r) > 0.97 * h - 1) continue;
+      // Die längere Seite steht über: oben die mit der kleineren Oberkante, unten die mit der größeren Unterkante.
+      const leftLonger = isTop ? l < r : l > r;
+      // Schrift im überstehenden Teil: insgesamt (breites Fenster) und auch direkt an der Schnittstelle.
+      const span = (k) => (leftLonger ? [Math.max(x0, c - k * WIN), c] : [c + 1, Math.min(x1 + 1, c + 1 + k * WIN)]);
+      const inkNear = inkIn(...span(2), Math.min(l, r), Math.max(l, r));
+      const inkWide = inkIn(...span(4), Math.min(l, r), Math.max(l, r));
+      if (inkWide >= 0.02 && inkNear >= 0.005) s += d;
+    }
+    return s / height;
+  };
+  const steps = new Float32Array(w);
+  for (let c = x0 + 3; c <= x1 - 3; c++) steps[c] = stepAt(c);
+  // Örtliche Spitzen über der Schwelle, mindestens WIN Spalten auseinander.
+  const cuts = [];
+  for (let c = x0 + 3; c <= x1 - 3; c++) {
+    if (steps[c] < 0.08) continue;
+    let peak = true;
+    for (let d = -WIN; d <= WIN && peak; d++) {
+      const v = steps[c + d] || 0;
+      if (v > steps[c] || (v === steps[c] && d < 0)) peak = false;
+    }
+    if (peak) cuts.push(c);
+  }
+  if (!cuts.length) return [[xs, ys]];
+  // Abschnitte bilden; schmale Abschnitte am Rand verwerfen, innen dem Nachbarn mit ähnlicheren Kanten zuschlagen.
+  const bounds = [x0, ...cuts, x1 + 1];
+  const segs = bounds.slice(0, -1).map((a, i) => ({ a, b: bounds[i + 1] }));
+  const minW = Math.max(6, 0.12 * height);
+  const edgesOf = (sg) => [medianRange(top, sg.a, sg.b), medianRange(bottom, sg.a, sg.b)];
+  for (;;) {
+    const i = segs.findIndex((sg) => sg.b - sg.a < minW);
+    if (i < 0 || segs.length === 1) break;
+    if (i === 0 || i === segs.length - 1) { segs.splice(i, 1); continue; }
+    const [t, bt] = edgesOf(segs[i]);
+    const diff = (sg) => { const [t2, b2] = edgesOf(sg); return Math.abs(t - t2) + Math.abs(bt - b2); };
+    const j = diff(segs[i - 1]) <= diff(segs[i + 1]) ? i - 1 : i + 1;
+    segs[j] = { a: Math.min(segs[i].a, segs[j].a), b: Math.max(segs[i].b, segs[j].b) };
+    segs.splice(i, 1);
+  }
+  const out = segs.map(() => [[], []]);
+  for (let i = 0; i < n; i++) {
+    const k = segs.findIndex((sg) => xs[i] >= sg.a && xs[i] < sg.b);
+    if (k >= 0) { out[k][0].push(xs[i]); out[k][1].push(ys[i]); }
+  }
+  return out.filter((o) => o[0].length);
+}
+
 /**
  * Sucht Belege auf dem Bild (ImageBitmap, Image oder Canvas).
  * Ergebnis: Rechtecke { x, y, w, h } als Anteile von 0 bis 1, von links nach rechts sortiert.
@@ -151,52 +252,8 @@ export function detectReceipts(src) {
     if (pts.length / N < 0.02) continue;
     const xsAll = Int32Array.from(pts, (p) => p % w);
     const ysAll = Int32Array.from(pts, (p) => Math.floor(p / w));
-    const sx = Int32Array.from(xsAll).sort();
-    const sy = Int32Array.from(ysAll).sort();
-    const x0 = percentile(sx, 1);
-    const x1 = percentile(sx, 99);
-    const y0 = percentile(sy, 1);
-    const y1 = percentile(sy, 99);
-    let parts = [[xsAll, ysAll]];
-    // Breite Fläche: zwei aneinanderliegende Belege sind fast immer verschieden lang. Geteilt wird nur,
-    // wenn Ober- oder Unterkante an einer Stelle sprunghaft wechselt (ein einzelner Beleg ist überall gleich lang).
-    let cut = -1;
-    if ((x1 - x0) / (y1 - y0 + 1) > 0.5) {
-      const colYs = Array.from({ length: w }, () => []);
-      for (let i = 0; i < xsAll.length; i++) colYs[xsAll[i]].push(ysAll[i]);
-      const top = new Float32Array(w).fill(NaN);
-      const bottom = new Float32Array(w).fill(NaN);
-      for (let x = x0; x <= x1; x++) {
-        if (colYs[x].length > 5) {
-          const s = Float32Array.from(colYs[x]).sort();
-          top[x] = percentile(s, 3);
-          bottom[x] = percentile(s, 97);
-        }
-      }
-      const median = (arr, a, b) => {
-        const v = [];
-        for (let x = a; x < b; x++) if (!Number.isNaN(arr[x])) v.push(arr[x]);
-        v.sort((p, q) => p - q);
-        return v.length ? v[Math.floor(v.length / 2)] : NaN;
-      };
-      let bestStep = 0;
-      for (let c = Math.floor(x0 + (x1 - x0) * 0.25); c < Math.floor(x0 + (x1 - x0) * 0.75); c++) {
-        const step = (Math.abs(median(bottom, x0, c) - median(bottom, c, x1 + 1))
-          + Math.abs(median(top, x0, c) - median(top, c, x1 + 1))) / (y1 - y0 + 1);
-        if (step > bestStep) { bestStep = step; cut = c; }
-      }
-      if (bestStep < 0.15) cut = -1;
-    }
-    if (cut >= 0) {
-      const left = [[], []];
-      const right = [[], []];
-      for (let i = 0; i < xsAll.length; i++) {
-        const t = xsAll[i] < cut ? left : right;
-        t[0].push(xsAll[i]);
-        t[1].push(ysAll[i]);
-      }
-      parts = [left, right];
-    }
+    const parts = splitReceipts(xsAll, ysAll, w, h, ink, core);
+    const kept = [];
     for (const [pxs, pys] of parts) {
       if (pxs.length / N < 0.02) continue;
       const qx = Int32Array.from(pxs).sort();
@@ -232,8 +289,20 @@ export function detectReceipts(src) {
       const ry0 = Math.max(0, by0 / h - 0.015);
       const rx1 = Math.min(1, bx1 / w + 0.03);
       const ry1 = Math.min(1, by1 / h + 0.015);
-      found.push({ x: rx0, y: ry0, w: rx1 - rx0, h: ry1 - ry0 });
+      let warmSum = 0;
+      let warmN = 0;
+      for (let y = by0; y < by1; y++) {
+        for (let x = bx0; x < bx1; x++) {
+          const i = y * w + x;
+          if (mask[i] && bright[i]) { warmSum += warm[i]; warmN++; }
+        }
+      }
+      kept.push({ box: { x: rx0, y: ry0, w: rx1 - rx0, h: ry1 - ry0 }, warmth: warmN ? warmSum / warmN : 0 });
     }
+    // Aus derselben Fläche nur Teile, die ähnlich warm sind wie der wärmste: Thermopapier ist deutlich wärmer
+    // als daneben liegendes, nur warm angestrahltes Kopierpapier.
+    const maxWarm = Math.max(0, ...kept.map((k) => k.warmth));
+    for (const k of kept) if (k.warmth >= 0.6 * maxWarm) found.push(k.box);
   }
   return found.sort((a, b) => a.x - b.x);
 }

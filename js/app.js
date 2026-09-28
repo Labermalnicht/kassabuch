@@ -27,6 +27,7 @@ const S = {
   queue: [],
   queueTotal: 0,
   queueDone: 0,
+  scan: null, // laufende Scan-Runde { count }
   busy: false,
 };
 
@@ -222,8 +223,8 @@ function viewHome() {
 
   const act = (a, ic, label, cls = '') => `<button class="act ${cls}" data-act="${a}">${icon(ic)}<span>${label}</span></button>`;
   const actions = [
-    act('receipt-camera', 'camera', t('act.camera'), 'primary wide'),
-    act('qr-scan', 'qr', t('act.qr'), 'scan wide'),
+    act('qr-scan', 'camera', t('act.scan'), 'primary wide'),
+    act('receipt-camera', 'image', t('act.camera')),
     act('receipt-gallery', 'image', t('act.gallery')),
     act('new:takings', 'cash', t('act.takings')),
     act('new:tips', 'coins', t('act.tips')),
@@ -444,7 +445,7 @@ function viewModal() {
     foot = `<button class="btn primary grow" data-act="salary-save" ${n ? '' : 'disabled'}>${t('salary.book', { n })}</button>`;
   } else if (m.type === 'scan') {
     title = t('scan.title') + (m.count ? ` (${t('scan.count', { n: m.count })})` : '');
-    body = `<div class="scan-wrap"><video id="scan-video" playsinline muted autoplay></video><div class="scan-frame"></div></div>
+    body = `<div class="scan-wrap"><video id="scan-video" playsinline muted autoplay></video><div class="scan-boxes" id="scan-boxes"></div></div>
 <p class="scan-status" id="scan-status" role="status">${t('scan.hint')}</p>`;
     foot = `<button class="btn" data-act="scan-photo">${icon('camera')}<span>${t('scan.photo')}</span></button>
       <button class="btn primary grow" data-act="scan-done">${t('scan.done')}</button>`;
@@ -910,19 +911,6 @@ function applyRecognition(m, res) {
 
 // ---------- Speichern ----------
 
-function checkWarnings(newEntries, replacedIds = []) {
-  const warns = [];
-  const others = S.entries.filter((x) => !replacedIds.includes(x.id));
-  const list = withBalances(S.biz, [...others, ...newEntries]);
-  if (newEntries.some((e) => e.dir === 'out')) {
-    const ids = new Set(newEntries.map((e) => e.id));
-    const start = list.findIndex((x) => ids.has(x.id));
-    const neg = list.slice(start).find((x) => x.balance < 0);
-    if (neg) warns.push(t('warn.negative', { date: fmtDate(neg.date), amount: fmtMoney(neg.balance) }));
-  }
-  return warns;
-}
-
 async function saveEntry() {
   syncModal();
   const m = S.modal;
@@ -969,7 +957,6 @@ async function saveEntry() {
     warns.push(t('warn.duplicate'));
   }
   if (e.rksvKey && others.some((x) => x.rksvKey === e.rksvKey)) warns.unshift(t('warn.rksvDup'));
-  warns.push(...checkWarnings([e], [e.id]));
   if (warns.length && !window.confirm(`${warns.join('\n\n')}\n\n${t('warn.saveAnyway')}`)) return;
 
   await db.put('entries', e);
@@ -1005,14 +992,30 @@ async function saveEntry() {
   S.modal = null;
   render();
   showToast(t(m.editId ? 'toast.updated' : 'toast.saved'), 'ok');
-  if (m.fromScan) openScanner(m.scanCount || 0);
-  else if (S.queue.length) processNext();
+  if (S.scan && kind === 'receipt' && !m.editId) S.scan.count++;
+  if (S.queue.length) processNext();
+  else if (S.scan && kind === 'receipt') openScanner(S.scan.count);
 }
 
-// ---------- Sofort-Scan des RKSV-QR-Codes ----------
+// ---------- Live-Scan: RKSV-QR-Code sofort, sonst Bon automatisch erkennen ----------
 
-async function openScanner(count = 0) {
+// Erkannte Bons als Rahmen über dem Videobild (das Video füllt den Ausschnitt, Ränder sind abgeschnitten).
+function drawScanBoxes(boxes, progress) {
+  const v = document.getElementById('scan-video');
+  const layer = document.getElementById('scan-boxes');
+  if (!v || !layer || !v.videoWidth) return;
+  const vw = v.videoWidth;
+  const vh = v.videoHeight;
+  const sc = Math.max(v.clientWidth / vw, v.clientHeight / vh);
+  const ox = (v.clientWidth - vw * sc) / 2;
+  const oy = (v.clientHeight - vh * sc) / 2;
+  layer.innerHTML = boxes.map((b) => `<div class="scan-box${progress > 0 ? ' on' : ''}" style="left:${ox + b.x * vw * sc}px;top:${oy + b.y * vh * sc}px;width:${b.w * vw * sc}px;height:${b.h * vh * sc}px"></div>`).join('');
+}
+
+// Scan-Runde: S.scan zählt die erfassten Belege; nach jedem Speichern geht es zurück zur Kamera.
+async function openScanner(count = 0, fresh = false) {
   const token = uid();
+  S.scan = { ...(fresh ? {} : S.scan), count };
   S.modal = { type: 'scan', token, count };
   render();
   const alive = () => S.modal && S.modal.token === token;
@@ -1022,21 +1025,45 @@ async function openScanner(count = 0) {
   };
   let lastOther = 0;
   let lastDup = '';
+  let holding = false;
   await startScanner(document.getElementById('scan-video'), {
+    fresh,
     stillWanted: alive,
     onRksv: (q, frame) => {
       if (!alive()) return;
       const key = `${q.kassenId}|${q.belegNr}`;
+      if (S.scan && S.scan.skipKey === key) return;
       if (S.entries.some((x) => x.rksvKey === key)) {
         if (lastDup !== key) { lastDup = key; status(t('scan.dup', { nr: q.belegNr }), 'warn'); if (navigator.vibrate) navigator.vibrate([40, 60, 40]); }
         return;
       }
       stopScanner();
       if (navigator.vibrate) navigator.vibrate(80);
-      openFromRksv(q, frame, count);
+      openFromRksv(q, frame);
     },
     onOther: () => {
-      if (Date.now() - lastOther > 2500) { lastOther = Date.now(); status(t('scan.other'), 'warn'); }
+      if (!holding && Date.now() - lastOther > 2500) { lastOther = Date.now(); status(t('scan.other'), 'warn'); }
+    },
+    onBoxes: (boxes, progress) => {
+      if (!alive()) return;
+      drawScanBoxes(boxes, progress);
+      if (progress > 0) status(t('scan.hold'));
+      else if (holding) status(t('scan.hint'));
+      holding = progress > 0;
+    },
+    // Bon liegt ruhig im Bild, aber ohne lesbaren Code: Foto übernehmen und direkt zum Zuschneiden.
+    onReceipt: (frame) => {
+      if (!alive()) return;
+      stopScanner();
+      if (navigator.vibrate) navigator.vibrate(60);
+      frame.toBlob((blob) => {
+        if (!alive() || !blob) return;
+        S.queue = [];
+        S.queueTotal = 1;
+        S.queueDone = 0;
+        S.queue.push(blob);
+        processNext();
+      }, 'image/jpeg', 0.92);
     },
     onError: (err) => { console.warn('Kamera', err); if (alive()) status(t('scan.noCamera'), 'err'); },
   });
@@ -1046,7 +1073,7 @@ function kassenProfile(kassenId) {
   return Object.values(S.biz.suppliers || {}).find((s) => (s.ids || []).includes(`KASSE:${kassenId}`)) || null;
 }
 
-function openFromRksv(q, frame, count) {
+function openFromRksv(q, frame) {
   const prof = kassenProfile(q.kassenId);
   openEntry('receipt', {
     date: q.date, amount: fmtAmountInput(q.total), ref: q.belegNr,
@@ -1055,8 +1082,6 @@ function openFromRksv(q, frame, count) {
   const m = S.modal;
   m.rksvKey = `${q.kassenId}|${q.belegNr}`;
   m.kassenId = q.kassenId;
-  m.fromScan = true;
-  m.scanCount = count + 1;
   // Werte aus dem Code sind exakt und werden von der Texterkennung nicht mehr überschrieben.
   ['date', 'amount', 'ref'].forEach((k) => m.touched.add(k));
   if (prof) { m.touched.add('party'); m.touched.add('desc'); }
@@ -1136,8 +1161,6 @@ async function saveSalary() {
     id: uid(), bizId: S.biz.id, kind: 'salary', date: m.date, party: r.name, desc,
     amount: parseAmount(r.amount), dir: 'out', created: base + i,
   }));
-  const warns = checkWarnings(entries);
-  if (warns.length && !window.confirm(`${warns.join('\n\n')}\n\n${t('warn.saveAnyway')}`)) return;
   await db.putMany('entries', entries);
   S.entries = [...S.entries, ...entries];
   S.biz.employees = S.biz.employees.map((emp) => {
@@ -1157,6 +1180,9 @@ async function saveSalary() {
 
 async function runExport() {
   if (S.busy) return;
+  // Negativer Kassastand im Exportjahr: Hinweis, weiter nur nach Bestätigung. In Excel wird er rot markiert.
+  const neg = yearInfo(S.biz, S.entries, S.exportYear).entries.find((e) => e.balance < 0);
+  if (neg && !window.confirm(t('export.negative', { date: fmtDate(neg.date), amount: fmtMoney(neg.balance) }))) return;
   S.busy = true;
   render();
   try {
@@ -1226,12 +1252,12 @@ document.addEventListener('click', async (ev) => {
   if (!el || el.disabled) return;
   const [act, arg] = el.dataset.act.split(/:(.*)/s);
   switch (act) {
-    case 'nav': S.view = arg; S.modal = null; render(); window.scrollTo(0, 0); break;
+    case 'nav': S.view = arg; S.modal = null; S.scan = null; render(); window.scrollTo(0, 0); break;
     case 'month': S.month = shiftMonth(S.month, Number(arg)); render(); break;
     case 'receipt-camera': document.getElementById('in-camera').click(); break;
-    case 'qr-scan': openScanner(0); break;
-    case 'scan-done': S.modal = null; render(); break;
-    case 'scan-photo': S.modal = null; render(); document.getElementById('in-camera').click(); break;
+    case 'qr-scan': openScanner(0, true); break;
+    case 'scan-done': S.scan = null; S.modal = null; render(); break;
+    case 'scan-photo': S.scan = null; S.modal = null; render(); document.getElementById('in-camera').click(); break;
     case 'receipt-gallery': document.getElementById('in-gallery').click(); break;
     case 'backup-import': document.getElementById('in-backup').click(); break;
     case 'new': openEntry(arg); break;
@@ -1240,7 +1266,14 @@ document.addEventListener('click', async (ev) => {
     case 'modal-close':
       if (S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop') && S.queue.length) {
         S.modal = null; render(); processNext();
-      } else closeModal();
+      } else if (S.scan && S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop') && !S.modal.editId) {
+        // Beleg aus der Scan-Runde verworfen: zurück zur Kamera, denselben Code dabei nicht gleich wieder öffnen.
+        if (S.modal.rksvKey) S.scan.skipKey = S.modal.rksvKey;
+        openScanner(S.scan.count);
+      } else {
+        S.scan = null;
+        closeModal();
+      }
       break;
     case 'entry-save': saveEntry(); break;
     case 'crop-use': useCrop(false); break;

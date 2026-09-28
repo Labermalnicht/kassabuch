@@ -6,6 +6,13 @@ export const XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsh
 const NUM = '#,##0.00';
 // Hintergrund der Tageslosung-Zeilen, für alle Betriebe gleich.
 const TAKINGS_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFDCEAF7' } };
+// Negativer Kassastand: rot hinterlegt und rot geschrieben, damit die Stelle sofort auffällt.
+const NEG_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC7CE' } };
+const markNeg = (cell, value, bold = false) => {
+  if (value >= 0) return;
+  cell.fill = NEG_FILL;
+  cell.font = { color: { argb: 'FFC00000' }, bold };
+};
 const BACKUP_SHEET = '_daten';
 const BACKUP_MARK = 'KASSABUCH-SICHERUNG';
 const CHUNK = 30000; // Excel erlaubt höchstens 32.767 Zeichen pro Zelle
@@ -109,6 +116,7 @@ export async function buildWorkbook(biz, entries, year) {
     r2.getCell(3).value = String(year);
     r2.getCell(8).value = prevRef ? { formula: prevRef, result: eur(carry) } : eur(carry);
     r2.getCell(8).numFmt = NUM;
+    markNeg(r2.getCell(8), carry);
 
     const monthEntries = info.entries.filter((e) => Number(e.date.slice(5, 7)) === m);
     let r = 3;
@@ -136,6 +144,7 @@ export async function buildWorkbook(biz, entries, year) {
       row.getCell(7).numFmt = NUM;
       row.getCell(8).value = { formula: `H${r - 1}-F${r}+G${r}`, result: eur(e.balance) };
       row.getCell(8).numFmt = NUM;
+      markNeg(row.getCell(8), e.balance);
       if (e.kind === 'takings') {
         // Wie im Original: Lieferant bis BAR einfärben (B, D, E, F, G), LNr., Datum und Kassa bleiben weiß.
         [2, 4, 5, 6, 7].forEach((c) => { row.getCell(c).fill = TAKINGS_FILL; });
@@ -168,6 +177,7 @@ export async function buildWorkbook(biz, entries, year) {
         cell.border = { top: { style: 'thin' } };
         if (c >= 6) cell.numFmt = NUM;
       }
+      markNeg(sum.getCell(8), carry, true);
       const sub = ws.getRow(r + 1);
       sub.getCell(2).value = `davon ${BOOK.takings}`;
       sub.getCell(7).value = { formula: `SUMIF(B3:B${lastRow},"${BOOK.takings}",G3:G${lastRow})`, result: eur(takings) };

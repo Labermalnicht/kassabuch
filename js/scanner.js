@@ -1,6 +1,8 @@
 // Live-Scanner: Kamera läuft als Videobild, mehrmals pro Sekunde wird nach dem RKSV-QR-Code gesucht.
 // Android/Chrome: eingebauter BarcodeDetector. iPhone/Safari: jsQR auf einem verkleinerten Einzelbild.
+// Zusätzlich wird etwa zweimal pro Sekunde nach Kassenbons gesucht: Liegt ein Bon ruhig im Bild, wird er übernommen.
 import { parseRksv, loadQrLib } from './rksv.js';
+import { detectReceipts } from './detect.js';
 
 let stream = null;
 let timer = null;
@@ -8,6 +10,20 @@ let video = null;
 let detector = null;
 let busy = false;
 const work = document.createElement('canvas');
+const detWork = document.createElement('canvas');
+const DETECT_EVERY = 450; // ms zwischen zwei Bonsuchen
+const STABLE_HITS = 3; // so oft hintereinander an derselben Stelle, dann gilt der Bon als ruhig gehalten
+let lastDetect = 0;
+let track = null; // { box, hits } des aktuell verfolgten Bons
+// Zuletzt übernommener Bon: erst wieder auslösen, wenn er aus dem Bild war oder sich deutlich bewegt hat.
+let blocked = null;
+
+const iou = (a, b) => {
+  const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+  const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+  const i = ix * iy;
+  return i / (a.w * a.h + b.w * b.h - i);
+};
 
 export const scannerActive = () => !!stream;
 
@@ -36,14 +52,43 @@ export function stopScanner() {
   if (video) video.srcObject = null;
   video = null;
   busy = false;
+  track = null;
+}
+
+// Bonsuche auf einem verkleinerten Kamerabild. Liefert die Bons und, sobald einer ruhig liegt, true.
+function detectStep(onBoxes) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const sc = Math.min(1, 480 / Math.max(vw, vh));
+  detWork.width = Math.round(vw * sc);
+  detWork.height = Math.round(vh * sc);
+  detWork.getContext('2d', { willReadFrequently: true }).drawImage(video, 0, 0, detWork.width, detWork.height);
+  // Nur ausreichend große Bons: ein winziger Bon im Bild ergibt keine lesbare Schrift.
+  const boxes = detectReceipts(detWork).filter((b) => b.w * b.h >= 0.06);
+  const main = boxes.reduce((best, b) => (!best || b.w * b.h > best.w * best.h ? b : best), null);
+  if (blocked && (!main || iou(main, blocked) < 0.5)) blocked = null;
+  if (!main || blocked) {
+    track = null;
+    if (onBoxes) onBoxes(boxes, 0);
+    return false;
+  }
+  track = track && iou(track.box, main) >= 0.8 ? { box: main, hits: track.hits + 1 } : { box: main, hits: 1 };
+  if (onBoxes) onBoxes(boxes, track.hits / STABLE_HITS);
+  if (track.hits < STABLE_HITS) return false;
+  blocked = main;
+  return true;
 }
 
 /**
  * Startet Kamera und Suche. onRksv(inhalt, bild) wird beim ersten gültigen RKSV-Code aufgerufen,
  * onOther() bei anderen QR-Codes (z. B. Feedback-Links), onError(fehler) wenn die Kamera nicht verfügbar ist.
+ * onReceipt(bild) wird aufgerufen, wenn ein Bon ohne lesbaren Code ruhig im Bild liegt; onBoxes(bons, fortschritt)
+ * nach jeder Bonsuche für die Anzeige. fresh: neue Scan-Runde, ein zuvor übernommener Bon zählt wieder.
  */
-export async function startScanner(videoEl, { onRksv, onOther, onError, stillWanted }) {
+export async function startScanner(videoEl, { onRksv, onOther, onError, stillWanted, onReceipt, onBoxes, fresh }) {
   stopScanner();
+  if (fresh) blocked = null;
+  lastDetect = Date.now() + 600; // erste Bonsuche erst, wenn die Kamera scharf gestellt hat
   let s;
   try {
     s = await navigator.mediaDevices.getUserMedia({
@@ -96,9 +141,18 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
       }
       for (const txt of texts) {
         const q = parseRksv(txt);
-        if (q) { onRksv(q, grabFrame()); return; }
+        if (q) {
+          // Dieser Bon ist über seinen Code erledigt (oder schon erfasst): nicht zusätzlich als Foto übernehmen.
+          if (onReceipt) { detectStep(null); blocked = (track && track.box) || blocked; track = null; }
+          onRksv(q, grabFrame());
+          return;
+        }
       }
       if (texts.length && onOther) onOther();
+      if (onReceipt && Date.now() - lastDetect >= DETECT_EVERY) {
+        lastDetect = Date.now();
+        if (detectStep(onBoxes)) { onReceipt(grabFrame()); return; }
+      }
     } catch (e) {
       console.warn('Scan', e);
     } finally {
