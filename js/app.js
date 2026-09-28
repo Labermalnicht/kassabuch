@@ -436,9 +436,11 @@ function ocrBox(o) {
   } else if (o.status === 'error') {
     parts.push(`<div class="ocr err">${icon('alert')}<span>${esc(o.msg || t('ocr.failed'))}</span></div>`);
   }
+  if (o.multi) parts.push(`<div class="ocr info">${icon('image')}<span>${esc(o.multi)}</span></div>`);
   if (o.note) parts.push(`<div class="ocr warn">${icon('alert')}<span>${esc(o.note)}</span></div>`);
   if (o.notReceipt) parts.push(`<div class="ocr warn">${icon('alert')}<span>${t('ocr.notReceipt')}</span></div>`);
   if (o.payment === 'karte') parts.push(`<div class="ocr info">${icon('cash')}<span>${t('ocr.card')}</span></div>`);
+  if (o.tip) parts.push(`<div class="ocr info">${icon('camera')}<span>${t('ocr.photoTip')}</span></div>`);
   return parts.join('');
 }
 
@@ -605,12 +607,21 @@ function addFiles(fileList) {
   if (!S.modal) processNext();
 }
 
+// Warteschlange: Fotos (File) oder bereits erkannte weitere Belege desselben Fotos.
 async function processNext() {
   const file = S.queue.shift();
   if (!file) return;
   S.queueDone++;
   openEntry('receipt');
   const m = S.modal;
+  if (file.recognized) {
+    m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
+    m.preview = file.preview;
+    applyRecognition(m, file.recognized);
+    m.ocr = { status: 'claude', payment: file.recognized.payment, multi: file.multi };
+    renderModal();
+    return;
+  }
   m.ocr = { status: 'running', offline: !S.settings.apiKey };
   m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
   renderModal();
@@ -631,9 +642,21 @@ async function processNext() {
 
   let res = null;
   let note = '';
+  let multi = '';
   if (S.settings.apiKey) {
     try {
-      res = await ocr.recognizeWithClaude({ apiKey: S.settings.apiKey, model: S.settings.model, base64: img.base64, biz: S.biz });
+      const list = await ocr.recognizeWithClaude({ apiKey: S.settings.apiKey, model: S.settings.model, base64: img.base64, biz: S.biz });
+      if (!list.length) {
+        res = { source: 'claude', isReceipt: false, supplier: '', date: null, ref: '', amount: null, category: null, payment: 'unbekannt' };
+      } else {
+        res = list[0];
+        if (list.length > 1) {
+          // Weitere Belege auf demselben Foto: direkt danach je ein eigenes Formular, ohne neue Erkennung.
+          multi = t('ocr.multi', { n: list.length });
+          S.queue.unshift(...list.slice(1).map((r, i) => ({ recognized: r, preview: img.thumb, multi: t('ocr.multiPos', { i: i + 2, n: list.length }) })));
+          S.queueTotal += list.length - 1;
+        }
+      }
     } catch (err) {
       console.warn('Claude-Erkennung fehlgeschlagen', err);
       note = t('ocr.fellBack', { reason: await ocr.explainError(err) });
@@ -655,7 +678,8 @@ async function processNext() {
   if (!alive()) return;
   syncModal();
   applyRecognition(m, res);
-  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt };
+  m.queuePos = S.queueTotal > 1 ? `${S.queueDone}/${S.queueTotal}` : '';
+  m.ocr = { status: res.source, note, payment: res.payment, notReceipt: !res.isReceipt, multi, tip: res.source === 'offline' };
   renderModal();
 }
 

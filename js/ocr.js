@@ -30,30 +30,39 @@ async function client(apiKey) {
 }
 
 const SYSTEM = `Du liest Kassenbons und Rechnungen österreichischer Kleinbetriebe für deren Kassabuch.
-Gib für das Foto genau die angeforderten Felder zurück:
-- is_receipt: true, wenn auf dem Foto ein Zahlungsbeleg, Kassenbon oder eine Rechnung zu sehen ist.
-- supplier: der Name des Geschäfts oder Lieferanten, kurz wie im Alltag geschrieben (z. B. "SPAR", "BILLA", "METRO"). Keine Adresse, keine Filialnummer. Ist der Lieferant in der Liste bekannter Lieferanten des Betriebs, übernimm genau diese Schreibweise.
+Auf einem Foto können mehrere Belege nebeneinander liegen. Gib jeden echten Beleg genau einmal im Feld receipts zurück, in der Reihenfolge von links nach rechts und oben nach unten. Kopien oder Durchschläge eines Belegs, die darunter oder daneben liegen, zählst du nicht als eigenen Beleg. Ein Kundenbeleg der Kartenzahlung, der auf demselben Bon mitgedruckt ist, gehört zu diesem Bon und ist kein eigener Beleg.
+Felder je Beleg:
+- supplier: der Name des Geschäfts oder Lieferanten, kurz wie im Alltag geschrieben (z. B. "SPAR", "BILLA", "METRO"). Keine Adresse, keine Filialnummer. Ist der Lieferant in der Liste bekannter Lieferanten des Betriebs, übernimm genau diese Schreibweise. Wenn das Logo nicht lesbar ist, achte auf Zeilen wie "Vielen Dank für Ihren Einkauf bei ..." oder die Internetadresse.
 - date: das Belegdatum im Format JJJJ-MM-TT.
-- receipt_number: die kurze Beleg-, Bon- oder Rechnungsnummer, wie sie auf dem Beleg steht, z. B. nach "Bon", "Bon-Nr.", "Beleg-Nr.", "Rechnungsnummer" oder "Re-Nr.". In einer Zeile wie "Kassier 123456 Kassa 001 Bon 1234" ist 1234 die Belegnummer. Nicht die Kassier- oder Kassennummer, nicht die Transaktions- oder Terminalnummer der Kartenzahlung, keine Signatur und keine Steuernummer.
-- total: der tatsächlich bezahlte Endbetrag brutto in Euro, nach Rabatten (Zeilen wie "Summe", "Gesamt", "Zu zahlen", "Total"). Nicht den gegebenen Betrag und nicht das Rückgeld.
+- receipt_number: die Bon- oder Rechnungsnummer der Kasse, z. B. nach "Bon", "Bon-Nr.", "Beleg:", "Rechnungsnummer" oder "Re-Nr.". In einer Zeile wie "Kassier 123456 Kassa 001 Bon 1234" ist 1234 die Belegnummer. Nicht nehmen: Kassier- oder Kassennummer, die "Beleg-Nr.", "Trace-Nr." oder "Trx"-Nummern im Kundenbeleg des Kartenterminals, die "RKSV-Beleg-Nr." (Signaturzähler), Signaturen, UID- oder Steuernummern.
+- total: der tatsächlich bezahlte Endbetrag brutto in Euro, nach Rabatten (Zeilen wie "Summe", "Gesamt", "Zu zahlen", "Total"). Nicht den gegebenen Betrag und nicht das Rück- oder Restgeld.
 - category: die passendste Kategorie aus der vorgegebenen Liste, anhand von Geschäft und Artikeln.
-- payment: "bar" bei Barzahlung (z. B. "Bar", "Gegeben", "Rückgeld"), "karte" bei Karten- oder Bankomatzahlung (z. B. "Karte", "Bankomat", "Maestro", "Visa", "Mastercard", "kontaktlos"), sonst "unbekannt".
-Wenn ein Feld nicht lesbar ist, gib null zurück. Rate keine Werte.`;
+- payment: "bar" bei Barzahlung (z. B. "Bar", "Gegeben", "Rückgeld"), "karte" bei Karten- oder Bankomatzahlung (z. B. "Karte", "Bankomat", "Maestro", "Visa", "Mastercard", "MC", "kontaktlos"), sonst "unbekannt".
+Wenn ein Feld nicht lesbar ist, gib null zurück. Rate keine Werte. Ist auf dem Foto kein Beleg zu sehen, gib eine leere Liste zurück.`;
 
 function schema(categories) {
   const nullable = (s) => ({ anyOf: [s, { type: 'null' }] });
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['is_receipt', 'supplier', 'date', 'receipt_number', 'total', 'category', 'payment'],
+    required: ['receipts'],
     properties: {
-      is_receipt: { type: 'boolean' },
-      supplier: nullable({ type: 'string' }),
-      date: nullable({ type: 'string', format: 'date' }),
-      receipt_number: nullable({ type: 'string' }),
-      total: nullable({ type: 'number' }),
-      category: { type: 'string', enum: categories },
-      payment: { type: 'string', enum: ['bar', 'karte', 'unbekannt'] },
+      receipts: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['supplier', 'date', 'receipt_number', 'total', 'category', 'payment'],
+          properties: {
+            supplier: nullable({ type: 'string' }),
+            date: nullable({ type: 'string', format: 'date' }),
+            receipt_number: nullable({ type: 'string' }),
+            total: nullable({ type: 'number' }),
+            category: { type: 'string', enum: categories },
+            payment: { type: 'string', enum: ['bar', 'karte', 'unbekannt'] },
+          },
+        },
+      },
     },
   };
 }
@@ -70,7 +79,7 @@ function userText(biz) {
     `Kategorien: ${biz.categories.join(', ')}`,
     `Bekannte Lieferanten: ${known.length ? known.join(', ') : 'noch keine'}`,
     `Heutiges Datum: ${todayISO()}`,
-    'Lies den Beleg auf dem Foto aus.',
+    'Lies alle Belege auf dem Foto aus.',
   ].join('\n');
 }
 
@@ -121,16 +130,17 @@ export async function recognizeWithClaude({ apiKey, model, base64, biz }) {
   if (resp.stop_reason === 'max_tokens') throw new Error(t('ocr.err.truncated'));
   const text = resp.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
   const data = JSON.parse(text);
-  return {
+  // Liste aller Belege auf dem Foto; leer, wenn kein Beleg erkannt wurde.
+  return (data.receipts || []).map((r) => ({
     source: 'claude',
-    isReceipt: data.is_receipt !== false,
-    supplier: data.supplier ? String(data.supplier).trim() : '',
-    date: plausibleDate(data.date),
-    ref: data.receipt_number ? String(data.receipt_number).trim() : '',
-    amount: typeof data.total === 'number' && data.total > 0 ? Math.round(data.total * 100) : null,
-    category: biz.categories.includes(data.category) ? data.category : null,
-    payment: data.payment || 'unbekannt',
-  };
+    isReceipt: true,
+    supplier: r.supplier ? String(r.supplier).trim() : '',
+    date: plausibleDate(r.date),
+    ref: r.receipt_number ? String(r.receipt_number).trim() : '',
+    amount: typeof r.total === 'number' && r.total > 0 ? Math.round(r.total * 100) : null,
+    category: biz.categories.includes(r.category) ? r.category : null,
+    payment: r.payment || 'unbekannt',
+  }));
 }
 
 // Prüft den Schlüssel kostenlos über die Modell-Abfrage.
@@ -182,8 +192,9 @@ export async function recognizeOffline(canvas, biz, onProgress) {
     workerPromise = window.Tesseract.createWorker('deu', 1, {
       logger: (m) => { if (m.status === 'recognizing text' && progressCb) progressCb(m.progress); },
     }).then(async (w) => {
-      // Seitenmodus 4: eine Textspalte, damit Artikel und Betrag in derselben Zeile bleiben.
-      await w.setParameters({ tessedit_pageseg_mode: '4' });
+      // Seitenmodus 6: ein zusammenhängender Textblock. Bei echten Belegfotos liefert er die vollständigsten Zeilen
+      // (verglichen mit den Modi 3, 4 und 11 an echten Belegfotos).
+      await w.setParameters({ tessedit_pageseg_mode: '6' });
       return w;
     }).catch((e) => { workerPromise = null; throw e; });
   }
@@ -192,29 +203,92 @@ export async function recognizeOffline(canvas, biz, onProgress) {
   return parseReceiptText(data.text || '', biz);
 }
 
-const AMOUNT_RE = /(\d{1,3}(?:[.\s]\d{3})*|\d+)[,.]\s?(\d{2})(?!\d)/g;
-const TOTAL_WORDS = /(zu\s*zahlen|zahlbetrag|summe|gesamt|total|endbetrag|betrag|bar\s*eur)/i;
-const SKIP_WORDS = /(gegeben|r(ü|ue)ckgeld|zur(ü|ue)ck|mwst|ust|netto|steuer|rabatt|ersparnis|punkte|pfand)/i;
+// Betrag mit zwei Nachkommastellen. Nicht Teil eines Datums ("18.09.2026"), keiner längeren Zahl und kein Prozentsatz.
+// Ohne Lookbehind, damit auch ältere iPhones den Ausdruck verstehen: das Zeichen davor wird mitgelesen.
+const AMOUNT_RE = /(^|[^\d.,])(\d{1,3}(?:\.\d{3})+|\d+)[,.]\s?(\d{2})(?!\d)(?![.,]\d)(?!\.\s?\d)(?!\s?%)/g;
+const STRONG_TOTAL = /(zu\s*zahlen|zahlbetrag|summe|gesamt|total|endbetrag|empfangen|betrag\s*eur|betrag\s*dankend)/i;
+const PAID = /(zahlung|\bbar\b|mastercard|\bmc\b|bankomat|karte|maestro|visa)/i;
+const GIVEN = /(gegeben|zahlung\s*bar|\bbar\s*eur|\bbar\b)/i;
+const CHANGE = /(r(ü|ue|u)ckgeld|restgeld|zur(ü|ue)ck)/i;
+const SKIP = /(r(ü|ue|u)ckgeld|restgeld|zur(ü|ue)ck|ersparnis|sparen|rabatt|punkte|pfand|zw-?summe|netto|mwst-?satz)/i;
 
-// Belegnummer, in dieser Reihenfolge gesucht:
-// "Bon-Nr.: 1234", "Belegnummer 12", dann "Rechnungsnr. RE01-123", dann "Kassa 001 Bon 1234" oder "Beleg: 1234".
-// Reine Zahlen ohne "Nr." brauchen mindestens drei Ziffern und dürfen kein Datum oder Betrag sein.
+// Belegnummer, nach Verlässlichkeit geordnet. Die "Beleg-Nr." des Kartenterminals und die
+// RKSV-Beleg-Nr. (Signaturzähler) kommen zuletzt bzw. gar nicht in Frage.
 const REF_PATTERNS = [
-  /\b(?:bon|beleg)[\s.-]*(?:nr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{1,19})/gi,
-  /\b(?:rechnungs?|rech|re|rg)[\s.-]*(?:nr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{1,19})/gi,
-  /\b(?:bon|beleg|rechnung)\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi,
-  /\b(?:bon|beleg|rechnung)\s*[:#]\s*([A-Z0-9][A-Z0-9/-]{1,19})/gi,
+  /\bbon[\s.-]*(?:nr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,19})/gi, // Bon-Nr.: 1234
+  /\bbon\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Kassa 001 Bon 1234
+  /\bbeleg\s*[:#]\s*(\d[\d/-]{2,19})\b/gi, // Beleg: 12345
+  /\b(?:rechnungs?|rech|re|rg)[\s.-]*(?:nr|mr|nummer|no)\.?\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,29})/gi, // Re-Nr: 0100-20260101-01-1234
+  /\bbeleg(?:nummer|[\s.-]*nr\.?)\s*[:#]?\s*([A-Z0-9][A-Z0-9/-]{2,19})/gi, // Beleg-Nr. 1234
+  /\brechnung\s*[:#]?\s+(\d[\d/-]{2,19})(?![.,]\d)\b/gi, // Rechnung 4711
 ];
+const REF_EXCLUDE = /(rks[vu]|signatur|trace|terminal|trx|uid|atu)/i;
 
 function amountsIn(line) {
   const out = [];
   let m;
   AMOUNT_RE.lastIndex = 0;
   while ((m = AMOUNT_RE.exec(line))) {
-    const c = parseAmount(m[1].replace(/[.\s]/g, '') + ',' + m[2]);
+    const c = parseAmount(m[2].replace(/\./g, '') + ',' + m[3]);
     if (c !== null && c > 0 && c < 10_000_000) out.push(c);
   }
   return out;
+}
+
+// Endbetrag per Punktevergabe: Summenzeilen, Zahlungszeilen, MwSt-Tabellen (netto + Steuer = brutto),
+// "Gegeben minus Rückgeld" und die Häufigkeit eines Betrags sprechen jeweils für ihn.
+function findTotal(lines) {
+  const score = new Map();
+  const add = (c, pts) => { if (c) score.set(c, (score.get(c) || 0) + pts); };
+  let given = null;
+  let change = null;
+  lines.forEach((l, i) => {
+    const a = amountsIn(l);
+    if (CHANGE.test(l)) { if (a.length) change = a[a.length - 1]; else { const n = amountsIn(lines[i + 1] || ''); if (n.length) change = n[0]; } }
+    if (GIVEN.test(l) && !CHANGE.test(l) && a.length) given = a[a.length - 1];
+    if (SKIP.test(l)) return;
+    a.forEach((c) => add(c, 1));
+    if (STRONG_TOTAL.test(l)) {
+      const own = a.length ? a : amountsIn(lines[i + 1] || '');
+      if (own.length) add(own[own.length - 1], 5);
+    } else if (PAID.test(l) && a.length) {
+      add(a[a.length - 1], 2);
+    }
+    if (a.length >= 3) {
+      const [x, y, z] = a.slice(-3);
+      if (Math.abs(x + y - z) <= 1) add(z, 4);
+    }
+  });
+  if (given && change && given > change) add(given - change, 5);
+  let best = null;
+  for (const [c, pts] of score) {
+    if (!best || pts > best[1] || (pts === best[1] && c > best[0])) best = [c, pts];
+  }
+  return best ? best[0] : null;
+}
+
+function findDate(text) {
+  const counts = new Map();
+  const re = /(\d{1,2})\s?[./-]\s?(\d{1,2})\s?[./,-]\s?(20\d{2}|\d{2})(?!\d)/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
+    const iso = plausibleDate(`${y}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`);
+    if (iso) counts.set(iso, (counts.get(iso) || 0) + 1);
+  }
+  let best = null;
+  for (const [d, n] of counts) if (!best || n > best[1]) best = [d, n];
+  return best ? best[0] : null;
+}
+
+function findRef(text) {
+  for (const re of REF_PATTERNS) {
+    for (const m of text.matchAll(re)) {
+      const before = text.slice(Math.max(0, m.index - 12), m.index);
+      if (/\d/.test(m[1]) && !REF_EXCLUDE.test(before + m[0])) return m[1].replace(/[/-]+$/, '');
+    }
+  }
+  return '';
 }
 
 // Heuristische Auswertung des erkannten Texts. Exportiert, damit sie testbar ist.
@@ -222,7 +296,8 @@ export function parseReceiptText(text, biz) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const full = lines.join('\n');
 
-  // Lieferant: bekannte Kette, gelernter Lieferant oder erste Zeile mit Buchstaben.
+  // Lieferant: gelernter Lieferant, bekannte Kette (auch in "Vielen Dank ... bei SPAR" oder der Internetadresse)
+  // oder die erste Zeile mit Buchstaben.
   let supplier = '';
   const known = Object.values(biz.suppliers || {}).map((s) => s.name);
   for (const name of known) {
@@ -233,45 +308,24 @@ export function parseReceiptText(text, biz) {
     if (chain) supplier = chain;
   }
   if (!supplier) {
-    supplier = lines.find((l) => (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 3 && !/^(rechnung|beleg|kassa|datum)/i.test(l)) || '';
+    // Firmenzeile mit Rechtsform, z. B. "... OG", "... GmbH", "... KG"
+    supplier = lines.slice(0, 15).find((l) => /\b(GmbH|GesmbH|OG|0G|KG|AG|e\.\s?U\.)\b/.test(l)
+      && (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 5) || '';
   }
-  supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 60);
-
-  // Datum
-  let date = null;
-  const dm = full.match(/(\d{1,2})[./-](\d{1,2})[./-](\d{4}|\d{2})\b/);
-  if (dm) {
-    let y = dm[3].length === 2 ? 2000 + Number(dm[3]) : Number(dm[3]);
-    const iso = `${y}-${String(dm[2]).padStart(2, '0')}-${String(dm[1]).padStart(2, '0')}`;
-    date = plausibleDate(iso);
+  if (!supplier) {
+    supplier = lines.find((l) => (l.match(/[A-Za-zÄÖÜäöüß]/g) || []).length >= 4
+      && !/^(rechnung|beleg|kassa|datum|summe|www|tel)/i.test(l)) || '';
   }
-
-  // Endbetrag: Zeile mit Summenwort, sonst größter Betrag ohne Rückgeld/Steuerzeilen.
-  let amount = null;
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i];
-    if (TOTAL_WORDS.test(l) && !SKIP_WORDS.test(l)) {
-      const a = amountsIn(l);
-      const next = a.length ? a : amountsIn(lines[i + 1] || '');
-      if (next.length) { amount = next[next.length - 1]; if (/zu\s*zahlen|summe|gesamt|total/i.test(l)) break; }
-    }
-  }
-  if (amount === null) {
-    const all = lines.filter((l) => !SKIP_WORDS.test(l)).flatMap(amountsIn);
-    if (all.length) amount = Math.max(...all);
-  }
-
-  // Belegnummer
-  let ref = '';
-  for (const re of REF_PATTERNS) {
-    const m = [...full.matchAll(re)].find((x) => /\d/.test(x[1]));
-    if (m) { ref = m[1]; break; }
-  }
+  supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim()
+    .replace(/\b0G\b/g, 'OG').replace(/\bGmbh\b/g, 'GmbH').replace(/\bK6\b/g, 'KG').slice(0, 60);
 
   // Zahlungsart
   let payment = 'unbekannt';
-  if (/bankomat|maestro|visa|mastercard|kontaktlos|kartenzahlung|zahlung\s*karte|debit\s*card|kreditkarte/i.test(full)) payment = 'karte';
-  else if (/\bbar\b|gegeben|r(ü|ue)ckgeld/i.test(full)) payment = 'bar';
+  if (/bankomat|maestro|visa|mastercard|kontaktlos|contactless|kartenzahlung|zahlung\s*karte|debit|kreditkarte|gegeben\s*mc/i.test(full)) payment = 'karte';
+  else if (/\bbar\b|gegeben|r(ü|ue)ckgeld|restgeld/i.test(full)) payment = 'bar';
 
-  return { source: 'offline', isReceipt: true, supplier, date, ref, amount, category: null, payment };
+  return {
+    source: 'offline', isReceipt: true, supplier, date: findDate(full), ref: findRef(full),
+    amount: findTotal(lines), category: null, payment,
+  };
 }
