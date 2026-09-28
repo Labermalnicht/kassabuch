@@ -805,6 +805,7 @@ async function saveEntry() {
       const l = ocr.learnFromReceipt(m.ocrText, { ref: e.ref, amount: e.amount });
       if (l.refLabel) learned.refLabel = l.refLabel;
       if (l.totalLabel) learned.totalLabel = l.totalLabel;
+      if (l.refTail) learned.refTail = l.refTail;
       learned.ids = [...new Set([...(old.ids || []), ...l.ids])].slice(0, 6);
     }
     Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });

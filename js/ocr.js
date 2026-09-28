@@ -353,9 +353,10 @@ export function parseReceiptText(text, biz) {
   }
   supplier = supplier.replace(/[^\p{L}\p{N}&.,'\s-]/gu, '').replace(/\s+/g, ' ').trim()
     .replace(/\b0G\b/g, 'OG').replace(/\bGmbh\b/g, 'GmbH').replace(/\bK6\b/g, 'KG').slice(0, 60);
-  if (!profile && supplier) {
-    const sug = suggest(biz, supplier);
-    profile = findLearned(biz, (sug && sug.name) || supplier);
+  let chain = null;
+  if (supplier) {
+    chain = suggest(biz, supplier);
+    if (!profile) profile = findLearned(biz, (chain && chain.name) || supplier);
   }
 
   // Zahlungsart
@@ -363,10 +364,24 @@ export function parseReceiptText(text, biz) {
   if (/bankomat|maestro|visa|mastercard|kontaktlos|contactless|kartenzahlung|zahlung\s*karte|debit|kreditkarte|gegeben\s*mc/i.test(full)) payment = 'karte';
   else if (/\bbar\b|gegeben|r(ü|ue)ckgeld|restgeld/i.test(full)) payment = 'bar';
 
+  const date = findDate(full);
+  let ref = findRef(full, profile);
+  // Belegnummer am Ende der Strichcode-Zahl (gelernt oder bei bekannten Ketten hinterlegt).
+  // Die Zahl muss das Belegdatum (JJMMTT) enthalten; dann ist sie verlässlicher als eine schlecht gelesene Textzeile.
+  const tail = (profile && profile.refTail) || (chain && chain.refTail) || 0;
+  if (tail) {
+    const code = barcodeNumbers(full).find((n) => !date || n.includes(date.slice(2).replace(/-/g, '')));
+    if (code && (date || !ref)) ref = code.slice(-tail);
+  }
   return {
-    source: 'offline', isReceipt: true, supplier, date: findDate(full), ref: findRef(full, profile),
+    source: 'offline', isReceipt: true, supplier, date, ref,
     amount: findTotal(lines, profile), category: null, payment, text: full, known: profile ? profile.name : '',
   };
+}
+
+// Lange Ziffernfolgen, wie sie unter Strichcodes gedruckt sind (einzelne Leerzeichen der Erkennung werden entfernt).
+function barcodeNumbers(text) {
+  return [...text.matchAll(/\d[\d ]{18,40}\d/g)].map((m) => m[0].replace(/ /g, '')).filter((n) => n.length >= 16);
 }
 
 // ---------- Lernen aus bestätigten Belegen ----------
@@ -394,8 +409,11 @@ function profileByFingerprint(biz, ids) {
 // Was lässt sich aus einem bestätigten Beleg über den Lieferanten lernen?
 // refLabel: Beschriftung vor der Belegnummer, totalLabel: Beschriftung der Betragszeile, ids: Merkmale.
 export function learnFromReceipt(text, { ref, amount }) {
-  const out = { refLabel: '', totalLabel: '', ids: fingerprintsOf(text || '') };
+  const out = { refLabel: '', totalLabel: '', refTail: 0, ids: fingerprintsOf(text || '') };
   if (!text) return out;
+  if (ref && /^\d{3,8}$/.test(String(ref)) && barcodeNumbers(text).some((n) => n.endsWith(String(ref)))) {
+    out.refTail = String(ref).length;
+  }
   if (ref) {
     const idx = text.toLowerCase().indexOf(String(ref).toLowerCase());
     if (idx > 0) {

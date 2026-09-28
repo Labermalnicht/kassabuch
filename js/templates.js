@@ -81,7 +81,8 @@ const DRUGSTORE = ['Hygieneartikel', 'Haar- und Kosmetikprodukte', 'Verbrauchsma
 const HARDWARE = ['Renovierungsmaterial', 'Material', 'Werkzeug', 'Reparaturen', 'Sonstiges'];
 const DECOR = ['Einrichtung und Deko', 'Ladeneinrichtung und Deko', 'Blumen und Dekoration', 'Interio', 'Sonstiges'];
 const PRESETS = [
-  { re: /\b(inter|euro)?spar\b|warenhandels/i, name: 'SPAR', cats: FOOD },
+  // refTail: die Zahl unter dem Strichcode endet mit der Bonnummer (4 Stellen).
+  { re: /\b(inter|euro)?spar\b|warenhandels/i, name: 'SPAR', cats: FOOD, refTail: 4 },
   { re: /\bbilla\b/i, name: 'BILLA', cats: FOOD },
   { re: /\bhofer\b/i, name: 'HOFER KG', cats: FOOD },
   { re: /\blidl\b/i, name: 'LIDL', cats: FOOD },
@@ -161,7 +162,7 @@ export function suggest(biz, party) {
   for (const p of PRESETS) {
     if (p.re.test(party)) {
       const cat = p.cats.find((c) => biz.categories.includes(c)) || null;
-      return { name: p.name, cat, learned: false };
+      return { name: p.name, cat, learned: false, refTail: p.refTail || 0 };
     }
   }
   return null;
