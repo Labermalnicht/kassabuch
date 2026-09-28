@@ -8,6 +8,7 @@ import {
 import { prepareImage, decodeForCrop, cropToBlob } from './image.js';
 import { detectReceipts } from './detect.js';
 import { scanRksv } from './rksv.js';
+import { startScanner, stopScanner, attachScanner } from './scanner.js';
 import * as ocr from './ocr.js';
 import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js';
 
@@ -54,6 +55,7 @@ const ICONS = {
   alert: '<path d="M10.3 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.7 3.86a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
   trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
   upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/>',
+  qr: '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 17h4v4h-4"/>',
 };
 const icon = (name, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
 
@@ -156,6 +158,12 @@ function render() {
   const main = S.view === 'export' ? viewExport() : S.view === 'settings' ? viewSettings() : viewHome();
   app.innerHTML = `${viewHeader()}<main class="main">${main}</main>${viewTabbar()}${hiddenInputs()}<div id="modal-root">${S.modal ? viewModal() : ''}</div>`;
   document.body.classList.toggle('modal-open', !!S.modal);
+  syncScanner();
+}
+
+function syncScanner() {
+  if (S.modal && S.modal.type === 'scan') attachScanner(document.getElementById('scan-video'));
+  else stopScanner();
 }
 
 function renderModal() {
@@ -163,6 +171,7 @@ function renderModal() {
   if (!root) return render();
   root.innerHTML = S.modal ? viewModal() : '';
   document.body.classList.toggle('modal-open', !!S.modal);
+  syncScanner();
 }
 
 function hiddenInputs() {
@@ -214,6 +223,7 @@ function viewHome() {
   const act = (a, ic, label, cls = '') => `<button class="act ${cls}" data-act="${a}">${icon(ic)}<span>${label}</span></button>`;
   const actions = [
     act('receipt-camera', 'camera', t('act.camera'), 'primary wide'),
+    act('qr-scan', 'qr', t('act.qr'), 'scan wide'),
     act('receipt-gallery', 'image', t('act.gallery')),
     act('new:takings', 'cash', t('act.takings')),
     act('new:tips', 'coins', t('act.tips')),
@@ -432,6 +442,12 @@ function viewModal() {
     body = salaryBody(m);
     const n = m.rows.filter((r) => r.on && parseAmount(r.amount) > 0).length;
     foot = `<button class="btn primary grow" data-act="salary-save" ${n ? '' : 'disabled'}>${t('salary.book', { n })}</button>`;
+  } else if (m.type === 'scan') {
+    title = t('scan.title') + (m.count ? ` (${t('scan.count', { n: m.count })})` : '');
+    body = `<div class="scan-wrap"><video id="scan-video" playsinline muted autoplay></video><div class="scan-frame"></div></div>
+<p class="scan-status" id="scan-status" role="status">${t('scan.hint')}</p>`;
+    foot = `<button class="btn" data-act="scan-photo">${icon('camera')}<span>${t('scan.photo')}</span></button>
+      <button class="btn primary grow" data-act="scan-done">${t('scan.done')}</button>`;
   } else if (m.type === 'crop') {
     title = t('crop.title') + (m.queuePos ? ` (${m.queuePos})` : '');
     const f = m.found || [];
@@ -481,6 +497,12 @@ function ocrBox(o) {
   const parts = [];
   if (o.status === 'running') {
     parts.push(`<div class="ocr run"><span class="spinner"></span><span>${t(o.offline ? 'ocr.runningOffline' : 'ocr.running')} <span id="ocr-progress"></span></span></div>`);
+  } else if (o.status === 'scan') {
+    parts.push(`<div class="ocr ok">${icon('qr')}<span>${t('ocr.scanDone')}</span></div>`);
+    if (o.supplierSearch) parts.push(`<div class="ocr run"><span class="spinner"></span><span>${t('ocr.supplierSearch')}</span></div>`);
+    else if (o.known) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.known', { name: o.known }))}</span></div>`);
+    else parts.push(`<div class="ocr warn">${icon('alert')}<span>${t('ocr.supplierCheck')}</span></div>`);
+    return parts.join('');
   } else if (o.status === 'claude' || o.status === 'offline') {
     // Immer sichtbar, sobald Daten aus dem Foto vorliegen.
     parts.push(`<div class="ocr warn">${icon('alert')}<span>${t(o.status === 'claude' ? 'ocr.doneClaude' : 'ocr.doneOffline')} ${t('ocr.check')}</span></div>`);
@@ -864,6 +886,8 @@ function mergeRksv(res, q) {
     if (diff <= 2) res.ref = tail;
   }
   res.rksv = true;
+  res.rksvKey = `${q.kassenId}|${q.belegNr}`;
+  res.kassenId = q.kassenId;
   return true;
 }
 
@@ -872,6 +896,7 @@ function applyRecognition(m, res) {
   const free = (k) => !m.touched.has(k);
   m.ocrSupplier = res.supplier || '';
   m.ocrText = res.text || '';
+  if (res.rksvKey) { m.rksvKey = res.rksvKey; m.kassenId = res.kassenId; }
   const sug = res.supplier ? suggest(S.biz, res.supplier) : null;
   if (free('party') && res.supplier) d.party = (sug && sug.name) || res.supplier;
   if (free('date') && res.date) d.date = res.date;
@@ -914,6 +939,7 @@ async function saveEntry() {
     case 'receipt':
       if (!d.party.trim()) return showToast(t('err.supplier'), 'err');
       Object.assign(e, { party: d.party.trim(), desc: d.desc, ref: d.ref.trim(), dir: 'out' });
+      if (m.rksvKey) e.rksvKey = m.rksvKey;
       break;
     case 'takings':
       Object.assign(e, { party: BOOK.takings, desc: BOOK.takingsDesc, dir: 'in' });
@@ -942,6 +968,7 @@ async function saveEntry() {
     && (kind !== 'receipt' || normKey(x.party) === normKey(e.party) || (e.ref && x.ref === e.ref)))) {
     warns.push(t('warn.duplicate'));
   }
+  if (e.rksvKey && others.some((x) => x.rksvKey === e.rksvKey)) warns.unshift(t('warn.rksvDup'));
   warns.push(...checkWarnings([e], [e.id]));
   if (warns.length && !window.confirm(`${warns.join('\n\n')}\n\n${t('warn.saveAnyway')}`)) return;
 
@@ -964,6 +991,8 @@ async function saveEntry() {
       if (l.refTail) learned.refTail = l.refTail;
       learned.ids = [...new Set([...(old.ids || []), ...l.ids])].slice(0, 6);
     }
+    // Kassen-ID aus dem RKSV-Code: dieselbe Kasse liefert beim nächsten Scan sofort den Lieferanten.
+    if (m.kassenId) learned.ids = [...new Set([...(learned.ids || old.ids || []), `KASSE:${m.kassenId}`])].slice(-12);
     Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
     sup[normKey(e.party)] = learned;
     if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) sup[normKey(m.ocrSupplier)] = learned;
@@ -976,7 +1005,98 @@ async function saveEntry() {
   S.modal = null;
   render();
   showToast(t(m.editId ? 'toast.updated' : 'toast.saved'), 'ok');
-  if (S.queue.length) processNext();
+  if (m.fromScan) openScanner(m.scanCount || 0);
+  else if (S.queue.length) processNext();
+}
+
+// ---------- Sofort-Scan des RKSV-QR-Codes ----------
+
+async function openScanner(count = 0) {
+  const token = uid();
+  S.modal = { type: 'scan', token, count };
+  render();
+  const alive = () => S.modal && S.modal.token === token;
+  const status = (txt, kind = '') => {
+    const el = document.getElementById('scan-status');
+    if (el) { el.textContent = txt; el.className = `scan-status ${kind}`; }
+  };
+  let lastOther = 0;
+  let lastDup = '';
+  await startScanner(document.getElementById('scan-video'), {
+    stillWanted: alive,
+    onRksv: (q, frame) => {
+      if (!alive()) return;
+      const key = `${q.kassenId}|${q.belegNr}`;
+      if (S.entries.some((x) => x.rksvKey === key)) {
+        if (lastDup !== key) { lastDup = key; status(t('scan.dup', { nr: q.belegNr }), 'warn'); if (navigator.vibrate) navigator.vibrate([40, 60, 40]); }
+        return;
+      }
+      stopScanner();
+      if (navigator.vibrate) navigator.vibrate(80);
+      openFromRksv(q, frame, count);
+    },
+    onOther: () => {
+      if (Date.now() - lastOther > 2500) { lastOther = Date.now(); status(t('scan.other'), 'warn'); }
+    },
+    onError: (err) => { console.warn('Kamera', err); if (alive()) status(t('scan.noCamera'), 'err'); },
+  });
+}
+
+function kassenProfile(kassenId) {
+  return Object.values(S.biz.suppliers || {}).find((s) => (s.ids || []).includes(`KASSE:${kassenId}`)) || null;
+}
+
+function openFromRksv(q, frame, count) {
+  const prof = kassenProfile(q.kassenId);
+  openEntry('receipt', {
+    date: q.date, amount: fmtAmountInput(q.total), ref: q.belegNr,
+    party: prof ? prof.name : '', desc: (prof && prof.cat && S.biz.categories.includes(prof.cat)) ? prof.cat : (S.biz.categories[0] || ''),
+  });
+  const m = S.modal;
+  m.rksvKey = `${q.kassenId}|${q.belegNr}`;
+  m.kassenId = q.kassenId;
+  m.fromScan = true;
+  m.scanCount = count + 1;
+  // Werte aus dem Code sind exakt und werden von der Texterkennung nicht mehr überschrieben.
+  ['date', 'amount', 'ref'].forEach((k) => m.touched.add(k));
+  if (prof) { m.touched.add('party'); m.touched.add('desc'); }
+  if (frame.width) {
+    const c = document.createElement('canvas');
+    const sc = 480 / Math.max(frame.width, frame.height);
+    c.width = Math.round(frame.width * sc);
+    c.height = Math.round(frame.height * sc);
+    c.getContext('2d').drawImage(frame, 0, 0, c.width, c.height);
+    m.preview = c.toDataURL('image/jpeg', 0.7);
+  }
+  m.ocr = { status: 'scan', known: prof ? prof.name : '', supplierSearch: !prof && !!frame.width };
+  renderModal();
+  if (!prof && frame.width) supplierFromFrame(m, frame);
+}
+
+// Lieferant (und Kategorie) aus dem Kamerabild lesen, ohne die exakten Werte aus dem Code anzutasten.
+async function supplierFromFrame(m, frame) {
+  const alive = () => S.modal === m;
+  let res = null;
+  try {
+    const blob = await new Promise((r) => frame.toBlob(r, 'image/jpeg', 0.92));
+    const img = await prepareImage(blob);
+    if (S.settings.apiKey) {
+      try {
+        const list = await ocr.recognizeWithClaude({ apiKey: S.settings.apiKey, model: S.settings.model, base64: img.base64, biz: S.biz });
+        res = list[0] || null;
+      } catch (e) { console.warn('Claude', e); }
+    }
+    if (!res) res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, null, img.ocrCanvasAlt);
+  } catch (e) { console.warn('Lieferant aus Kamerabild', e); }
+  if (!alive()) return;
+  syncModal();
+  if (res) {
+    const keep = { rksvKey: m.rksvKey, kassenId: m.kassenId };
+    applyRecognition(m, { ...res, date: null, amount: null, ref: '' });
+    Object.assign(m, keep);
+  }
+  m.ocr = { status: 'scan', known: '', supplierSearch: false };
+  renderModal();
 }
 
 async function deleteEntry() {
@@ -1109,6 +1229,9 @@ document.addEventListener('click', async (ev) => {
     case 'nav': S.view = arg; S.modal = null; render(); window.scrollTo(0, 0); break;
     case 'month': S.month = shiftMonth(S.month, Number(arg)); render(); break;
     case 'receipt-camera': document.getElementById('in-camera').click(); break;
+    case 'qr-scan': openScanner(0); break;
+    case 'scan-done': S.modal = null; render(); break;
+    case 'scan-photo': S.modal = null; render(); document.getElementById('in-camera').click(); break;
     case 'receipt-gallery': document.getElementById('in-gallery').click(); break;
     case 'backup-import': document.getElementById('in-backup').click(); break;
     case 'new': openEntry(arg); break;

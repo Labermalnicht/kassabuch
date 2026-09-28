@@ -303,6 +303,15 @@ input[type="date"] { display: block; }
 .crop-h[data-h="bl"] { left: -16px; bottom: -16px; cursor: nesw-resize; }
 .crop-h[data-h="br"] { right: -16px; bottom: -16px; cursor: nwse-resize; }
 
+/* ---------- Sofort-Scan ---------- */
+.act.scan { background: var(--accent-soft); color: var(--accent); border-color: transparent; justify-content: center; }
+.scan-wrap { position: relative; background: #000; border-radius: 14px; overflow: hidden; aspect-ratio: 3 / 4; max-height: 62dvh; margin: 0 auto 12px; }
+.scan-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.scan-frame { position: absolute; inset: 22% 16%; border: 3px solid rgba(255, 255, 255, .95); border-radius: 18px; box-shadow: 0 0 0 9999px rgba(0, 0, 0, .35); }
+.scan-status { text-align: center; font-weight: 600; min-height: 2.8em; margin: 0; }
+.scan-status.warn { color: var(--warn-ink); }
+.scan-status.err { color: var(--err-ink); }
+
 /* ---------- Toast ---------- */
 .toast {
   position: fixed; left: 50%; transform: translateX(-50%); z-index: 40;

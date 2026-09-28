@@ -21,7 +21,7 @@ export function parseRksv(text) {
 }
 
 let libPromise = null;
-function loadLib() {
+export function loadQrLib() {
   if (window.jsQR) return Promise.resolve(window.jsQR);
   if (!libPromise) {
     libPromise = new Promise((resolve, reject) => {
@@ -64,7 +64,7 @@ export async function scanRksv(src) {
   }
   // 2. jsQR über das ganze Bild und über Ausschnitte (Hälften, Drittel), damit auch kleine oder zweite Codes gefunden werden
   let jsQR;
-  try { jsQR = await loadLib(); } catch { return null; }
+  try { jsQR = await loadQrLib(); } catch { return null; }
   const regions = [
     { x: 0, y: 0, w: 1, h: 1 },
     { x: 0, y: 0.5, w: 1, h: 0.5 }, { x: 0, y: 0, w: 1, h: 0.5 },
