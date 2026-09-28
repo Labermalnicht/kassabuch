@@ -106,11 +106,57 @@ const PRESETS = [
 
 export const KNOWN_CHAINS = PRESETS.map((p) => p.re);
 
+// Typische Lesefehler der Texterkennung angleichen: 0/O, 1/l/I, 5/S, 6/G, 8/B.
+const fold = (s) => normKey(s).replace(/0/g, 'o').replace(/[1l]/g, 'i').replace(/5/g, 's').replace(/6/g, 'g').replace(/8/g, 'b');
+
+function levenshtein(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diag = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diag = tmp;
+    }
+  }
+  return prev[b.length];
+}
+
+// Ähnlichkeit zweier Namen zwischen 0 und 1.
+export function similarity(a, b) {
+  const x = fold(a);
+  const y = fold(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  return 1 - levenshtein(x, y) / Math.max(x.length, y.length);
+}
+
+// Gespeicherten (vom Nutzer bestätigten) Lieferanten zu einem erkannten Text finden:
+// exakt, als Teil einer längeren Zeile ("MUSTERFIRMA 0G Obsthandel") oder sehr ähnlich (ab 80 %).
+export function findLearned(biz, text) {
+  const sup = biz.suppliers || {};
+  const key = normKey(text);
+  if (!key) return null;
+  if (sup[key]) return sup[key];
+  const f = fold(text);
+  let best = null;
+  let bestScore = 0;
+  for (const [k, v] of Object.entries(sup)) {
+    const fk = fold(k);
+    if (fk.length < 4) continue;
+    let score = similarity(k, text);
+    if (fk.length >= 5 && f.includes(fk)) score = Math.max(score, 0.95);
+    if (score > bestScore) { best = v; bestScore = score; }
+  }
+  return bestScore >= 0.8 ? best : null;
+}
+
 // Vorschlag für Lieferantenname und Kategorie. Gelerntes hat Vorrang vor den Vorlagen.
 export function suggest(biz, party) {
   const key = normKey(party);
   if (!key) return null;
-  const learned = biz.suppliers && biz.suppliers[key];
+  const learned = findLearned(biz, party);
   if (learned) return { name: learned.name, cat: biz.categories.includes(learned.cat) ? learned.cat : null, learned: true };
   for (const p of PRESETS) {
     if (p.re.test(party)) {

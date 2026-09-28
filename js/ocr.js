@@ -1,6 +1,6 @@
 // Belegerkennung: mit API-Schlüssel über Claude, sonst offline mit Tesseract.
 import { t } from './i18n.js';
-import { KNOWN_CHAINS } from './templates.js';
+import { KNOWN_CHAINS, findLearned } from './templates.js';
 import { parseAmount, todayISO } from './ledger.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
@@ -299,9 +299,9 @@ export function parseReceiptText(text, biz) {
   // Lieferant: gelernter Lieferant, bekannte Kette (auch in "Vielen Dank ... bei SPAR" oder der Internetadresse)
   // oder die erste Zeile mit Buchstaben.
   let supplier = '';
-  const known = Object.values(biz.suppliers || {}).map((s) => s.name);
-  for (const name of known) {
-    if (name && name.length >= 3 && full.toLowerCase().includes(name.toLowerCase())) { supplier = name; break; }
+  for (const l of lines.slice(0, 25)) {
+    const hit = findLearned(biz, l);
+    if (hit) { supplier = hit.name; break; }
   }
   if (!supplier) {
     const chain = lines.find((l) => KNOWN_CHAINS.some((re) => re.test(l)));

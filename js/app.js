@@ -1,6 +1,6 @@
 import * as db from './db.js';
 import { t, setLang, getLang } from './i18n.js';
-import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest } from './templates.js';
+import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest, similarity } from './templates.js';
 import {
   parseAmount, fmtMoney, fmtAmountInput, fmtDate, fmtDay, fmtMonth, shiftMonth,
   withBalances, currentBalance, todayISO, uid,
@@ -93,10 +93,28 @@ function createBusiness({ name, template, startBalance, startDate }) {
   };
 }
 
+// Bekannte Lieferanten, die am häufigsten verwendeten zuerst.
 function suppliersList() {
-  const names = new Set(Object.values(S.biz.suppliers || {}).map((s) => s.name));
-  S.entries.filter((e) => e.kind === 'receipt').forEach((e) => names.add(e.party));
-  return [...names].filter(Boolean).sort((a, b) => a.localeCompare(b));
+  const count = new Map();
+  Object.values(S.biz.suppliers || {}).forEach((s) => { if (s.name) count.set(s.name, count.get(s.name) || 0); });
+  S.entries.filter((e) => e.kind === 'receipt' && e.party).forEach((e) => count.set(e.party, (count.get(e.party) || 0) + 1));
+  return [...count.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([n]) => n);
+}
+
+// Antippbare Lieferanten unter dem Eingabefeld, gefiltert nach dem bisher Getippten.
+function supplierChips(current) {
+  const q = normKey(current);
+  let names = suppliersList();
+  if (q) names = names.filter((n) => normKey(n).includes(q) || similarity(n, current) >= 0.6);
+  names = names.slice(0, 8);
+  return names.map((n) => `<button type="button" class="chip-btn ${n === current ? 'on' : ''}" data-act="pick-sup:${esc(n)}">${esc(n)}</button>`).join('');
+}
+
+// Gespeicherte Lieferanten für die Einstellungen, je Name einmal, alphabetisch.
+function learnedSuppliers() {
+  const byName = new Map();
+  Object.values(S.biz.suppliers || {}).forEach((s) => { if (s.name && !byName.has(s.name)) byName.set(s.name, s); });
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function partiesOf(kind, sub) {
@@ -301,6 +319,14 @@ function viewSettings() {
 </section>
 
 <section class="card pad">
+  <h2 class="sec-title">${t('set.suppliers')}</h2>
+  ${learnedSuppliers().length ? `<div class="card list inner">${learnedSuppliers().map((s) => `
+    <div class="row static"><span class="row-main"><span class="row-title">${esc(s.name)}</span>${s.cat ? `<span class="row-sub">${esc(s.cat)}</span>` : ''}</span>
+    <button class="icon-btn" data-act="sup-del:${esc(s.name)}" aria-label="${esc(t('delete'))} ${esc(s.name)}">${icon('trash')}</button></div>`).join('')}</div>
+  <p class="hint">${t('set.suppliersHint')}</p>` : `<p class="hint">${t('set.noSuppliers')}</p>`}
+</section>
+
+<section class="card pad">
   <h2 class="sec-title">${t('set.partners')}</h2>
   ${(b.partners || []).length ? `<div class="chips">${b.partners.map((p, i) => `<span class="chip">${esc(p)}<button data-act="partner-del:${i}" aria-label="${esc(t('delete'))} ${esc(p)}">${icon('x')}</button></span>`).join('')}</div>` : `<p class="hint">${t('set.noPartners')}</p>`}
   <div class="inline-add"><input type="text" id="partner-new" placeholder="${esc(t('f.partnerPh'))}" autocomplete="off"><button class="btn" data-act="partner-add">${icon('plus')}<span>${t('add')}</span></button></div>
@@ -453,6 +479,7 @@ function entryBody(m) {
 ${ocrBox(m.ocr)}
 ${inDate(d)}
 ${inText(d, 'party', t('f.supplier'), 'list="dl-sup"')}${datalist('dl-sup', suppliersList())}
+<div class="chips pick" id="sup-chips">${supplierChips(d.party)}</div>
 ${field(t('f.category'), catSelect(d.desc))}
 ${inText(d, 'ref', t('f.ref'))}
 ${inMoney(d, t('f.amountGross'))}`;
@@ -494,6 +521,7 @@ ${inMoney(d)}`;
 </div>
 ${inDate(d)}
 ${inText(d, 'party', t('f.party'), 'list="dl-sup"')}${datalist('dl-sup', suppliersList())}
+<div class="chips pick" id="sup-chips">${supplierChips(d.party)}</div>
 ${inText(d, 'desc', t('f.desc'), 'list="dl-cat"')}${datalist('dl-cat', S.biz.categories)}
 ${inText(d, 'ref', t('f.ref'))}
 ${inMoney(d)}`;
@@ -767,7 +795,7 @@ async function saveEntry() {
     S.biz.partners = [...(S.biz.partners || []), e.party];
     await saveBiz();
   }
-  if (kind === 'receipt') {
+  if (kind === 'receipt' || (kind === 'manual' && e.dir === 'out' && S.biz.categories.includes(e.desc))) {
     const learned = { name: e.party, cat: e.desc };
     S.biz.suppliers = { ...(S.biz.suppliers || {}), [normKey(e.party)]: learned };
     if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) S.biz.suppliers[normKey(m.ocrSupplier)] = learned;
@@ -985,6 +1013,25 @@ document.addEventListener('click', async (ev) => {
       render();
       break;
     }
+    case 'pick-sup': {
+      syncModal();
+      const d = S.modal.data;
+      d.party = arg;
+      S.modal.touched.add('party');
+      const sug = suggest(S.biz, arg);
+      if (sug && sug.cat && !S.modal.touched.has('desc') && S.modal.kind === 'receipt') d.desc = sug.cat;
+      renderModal();
+      break;
+    }
+    case 'sup-del': {
+      if (!window.confirm(t('confirm.supDelete', { name: arg }))) return;
+      const sup = { ...(S.biz.suppliers || {}) };
+      Object.keys(sup).forEach((k) => { if (sup[k].name === arg) delete sup[k]; });
+      S.biz.suppliers = sup;
+      await saveBiz();
+      render();
+      break;
+    }
     case 'pick-party':
       syncModal();
       S.modal.data.party = arg;
@@ -1078,6 +1125,10 @@ document.addEventListener('input', (ev) => {
       m.touched.add(el.dataset.f);
       m.data[el.dataset.f] = el.value;
       // Kategorie aus dem Lieferanten vorschlagen, solange sie nicht selbst gewählt wurde.
+      if (el.dataset.f === 'party') {
+        const chips = document.getElementById('sup-chips');
+        if (chips) chips.innerHTML = supplierChips(el.value);
+      }
       if (el.dataset.f === 'party' && m.kind === 'receipt' && !m.touched.has('desc')) {
         const sug = suggest(S.biz, el.value);
         const sel = document.querySelector('#modal-root [data-f="desc"]');
