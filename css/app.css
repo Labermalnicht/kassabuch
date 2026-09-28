@@ -307,6 +307,8 @@ input[type="date"] { display: block; }
 .act.scan { background: var(--accent-soft); color: var(--accent); border-color: transparent; justify-content: center; }
 .scan-wrap { position: relative; background: #000; border-radius: 14px; overflow: hidden; aspect-ratio: 3 / 4; max-height: 62dvh; margin: 0 auto 12px; }
 .scan-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sup-ask-img { display: block; max-width: 100%; max-height: 34dvh; margin: 0 auto 12px; border-radius: 10px; }
+.sup-ask-hint { margin: 0 0 12px; font-weight: 600; }
 .scan-boxes { position: absolute; inset: 0; pointer-events: none; }
 .scan-box { position: absolute; border: 3px dashed rgba(255, 255, 255, .9); border-radius: 8px; transition: all .2s ease; }
 .scan-box.on { border-style: solid; border-color: #3ddc84; box-shadow: 0 0 0 9999px rgba(0, 0, 0, .25); }

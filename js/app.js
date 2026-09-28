@@ -466,6 +466,14 @@ function viewModal() {
       : `<div class="ocr run"><span class="spinner"></span><span>${t('crop.loading')}</span></div>`;
     foot = `<button class="btn" data-act="crop-whole" ${m.preview ? '' : 'disabled'}>${t('crop.whole')}</button>
       <button class="btn primary grow" data-act="crop-use" ${m.preview ? '' : 'disabled'}>${icon('check')}<span>${t('crop.use')}</span></button>`;
+  } else if (m.type === 'supplierAsk') {
+    title = t('supAsk.title');
+    const names = [...new Set(Object.values(S.biz.suppliers || {}).map((x) => x.name))].sort((a, b) => a.localeCompare(b));
+    body = `${m.preview ? `<img class="sup-ask-img" src="${m.preview}" alt="${esc(t('ocr.photo'))}">` : ''}
+<p class="sup-ask-hint">${t('supAsk.hint')}</p>
+${field(t('f.supplier'), `<input type="text" id="sup-ask-input" list="sup-ask-list" value="${esc(m.name || '')}" autocomplete="off" enterkeyhint="done">`)}
+<datalist id="sup-ask-list">${names.map((n) => `<option value="${esc(n)}"></option>`).join('')}</datalist>`;
+    foot = `<button class="btn primary grow" data-act="sup-ask-ok">${icon('check')}<span>${t('supAsk.ok')}</span></button>`;
   } else if (m.type === 'bizPick') {
     title = t('biz.title');
     body = `<div class="card list">${S.businesses.map((b) => `<button class="row" data-act="biz-select:${esc(b.id)}"><span class="row-main"><span class="row-title">${esc(b.name)}</span><span class="row-sub">${t('tpl.' + b.template)}</span></span>${b.id === S.biz?.id ? icon('check', 'ok') : ''}</button>`).join('')}</div>`;
@@ -500,9 +508,8 @@ function ocrBox(o) {
     parts.push(`<div class="ocr run"><span class="spinner"></span><span>${t(o.offline ? 'ocr.runningOffline' : 'ocr.running')} <span id="ocr-progress"></span></span></div>`);
   } else if (o.status === 'scan') {
     parts.push(`<div class="ocr ok">${icon('qr')}<span>${t('ocr.scanDone')}</span></div>`);
-    if (o.supplierSearch) parts.push(`<div class="ocr run"><span class="spinner"></span><span>${t('ocr.supplierSearch')}</span></div>`);
+    if (o.saved) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.supplierSaved', { name: o.saved }))}</span></div>`);
     else if (o.known) parts.push(`<div class="ocr info">${icon('check')}<span>${esc(t('ocr.known', { name: o.known }))}</span></div>`);
-    else parts.push(`<div class="ocr warn">${icon('alert')}<span>${t('ocr.supplierCheck')}</span></div>`);
     return parts.join('');
   } else if (o.status === 'claude' || o.status === 'offline') {
     // Immer sichtbar, sobald Daten aus dem Foto vorliegen.
@@ -1039,7 +1046,7 @@ async function openScanner(count = 0, fresh = false) {
       }
       stopScanner();
       if (navigator.vibrate) navigator.vibrate(80);
-      openFromRksv(q, frame);
+      askOrOpenRksv(q, frame);
     },
     onOther: () => {
       if (!holding && Date.now() - lastOther > 2500) { lastOther = Date.now(); status(t('scan.other'), 'warn'); }
@@ -1075,54 +1082,56 @@ function kassenProfile(kassenId) {
   return Object.values(S.biz.suppliers || {}).find((s) => (s.ids || []).includes(`KASSE:${kassenId}`)) || null;
 }
 
-function openFromRksv(q, frame) {
+// Kleines Vorschaubild des Kamerabilds.
+function framePreview(frame) {
+  if (!frame.width) return null;
+  const c = document.createElement('canvas');
+  const sc = 480 / Math.max(frame.width, frame.height);
+  c.width = Math.round(frame.width * sc);
+  c.height = Math.round(frame.height * sc);
+  c.getContext('2d').drawImage(frame, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.7);
+}
+
+// Bekannte Kasse: gleich ins Formular. Unbekannte Kasse: Lieferant einmal von Hand eintragen, er wird zur Kassen-ID
+// gespeichert und bei allen künftigen Scans dieser Kasse automatisch übernommen.
+function askOrOpenRksv(q, frame) {
   const prof = kassenProfile(q.kassenId);
+  if (prof) { openFromRksv(q, frame, prof, false); return; }
+  S.modal = { type: 'supplierAsk', token: uid(), q, frame, preview: framePreview(frame), rksvKey: `${q.kassenId}|${q.belegNr}` };
+  renderModal();
+  setTimeout(() => document.getElementById('sup-ask-input')?.focus(), 50);
+}
+
+async function confirmSupplierAsk() {
+  const m = S.modal;
+  if (!m || m.type !== 'supplierAsk') return;
+  const name = (document.getElementById('sup-ask-input')?.value || '').replace(/\s+/g, ' ').trim();
+  if (!name) { showToast(t('err.supplier'), 'err'); return; }
+  const id = `KASSE:${m.q.kassenId}`;
+  const sup = { ...(S.biz.suppliers || {}) };
+  const key = Object.keys(sup).find((k) => normKey(sup[k].name) === normKey(name)) || normKey(name);
+  const old = sup[key] || {};
+  const sug = suggest(S.biz, name);
+  const cat = old.cat || (sug && sug.cat) || '';
+  sup[key] = { ...old, name: old.name || name, cat, count: old.count || 0, ids: [...new Set([...(old.ids || []), id])].slice(-12) };
+  S.biz.suppliers = sup;
+  await saveBiz();
+  openFromRksv(m.q, m.frame, sup[key], true);
+}
+
+function openFromRksv(q, frame, prof, saved) {
   openEntry('receipt', {
     date: q.date, amount: fmtAmountInput(q.total), ref: q.belegNr,
-    party: prof ? prof.name : '', desc: (prof && prof.cat && S.biz.categories.includes(prof.cat)) ? prof.cat : (S.biz.categories[0] || ''),
+    party: prof.name, desc: (prof.cat && S.biz.categories.includes(prof.cat)) ? prof.cat : (S.biz.categories[0] || ''),
   });
   const m = S.modal;
   m.rksvKey = `${q.kassenId}|${q.belegNr}`;
   m.kassenId = q.kassenId;
-  // Werte aus dem Code sind exakt und werden von der Texterkennung nicht mehr überschrieben.
-  ['date', 'amount', 'ref'].forEach((k) => m.touched.add(k));
-  if (prof) { m.touched.add('party'); m.touched.add('desc'); }
-  if (frame.width) {
-    const c = document.createElement('canvas');
-    const sc = 480 / Math.max(frame.width, frame.height);
-    c.width = Math.round(frame.width * sc);
-    c.height = Math.round(frame.height * sc);
-    c.getContext('2d').drawImage(frame, 0, 0, c.width, c.height);
-    m.preview = c.toDataURL('image/jpeg', 0.7);
-  }
-  m.ocr = { status: 'scan', known: prof ? prof.name : '', supplierSearch: !prof && !!frame.width };
-  renderModal();
-  if (!prof && frame.width) supplierFromFrame(m, frame);
-}
-
-// Lieferant (und Kategorie) aus dem Kamerabild lesen, ohne die exakten Werte aus dem Code anzutasten.
-async function supplierFromFrame(m, frame) {
-  const alive = () => S.modal === m;
-  let res = null;
-  try {
-    const blob = await new Promise((r) => frame.toBlob(r, 'image/jpeg', 0.92));
-    const img = await prepareImage(blob);
-    if (S.settings.apiKey) {
-      try {
-        const list = await ocr.recognizeWithClaude({ apiKey: S.settings.apiKey, model: S.settings.model, base64: img.base64, biz: S.biz });
-        res = list[0] || null;
-      } catch (e) { console.warn('Claude', e); }
-    }
-    if (!res) res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, null, img.ocrCanvasAlt);
-  } catch (e) { console.warn('Lieferant aus Kamerabild', e); }
-  if (!alive()) return;
-  syncModal();
-  if (res) {
-    const keep = { rksvKey: m.rksvKey, kassenId: m.kassenId };
-    applyRecognition(m, { ...res, date: null, amount: null, ref: '' });
-    Object.assign(m, keep);
-  }
-  m.ocr = { status: 'scan', known: '', supplierSearch: false };
+  // Werte aus dem Code sind exakt, der Lieferant ist gespeichert.
+  ['date', 'amount', 'ref', 'party', 'desc'].forEach((k) => m.touched.add(k));
+  m.preview = framePreview(frame);
+  m.ocr = saved ? { status: 'scan', saved: prof.name } : { status: 'scan', known: prof.name };
   renderModal();
 }
 
@@ -1249,6 +1258,11 @@ async function importBackup(file) {
 
 // ---------- Ereignisse ----------
 
+// Eingabetaste im Fenster "Neuer Lieferant" bestätigt.
+document.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Enter' && ev.target && ev.target.id === 'sup-ask-input') { ev.preventDefault(); confirmSupplierAsk(); }
+});
+
 document.addEventListener('click', async (ev) => {
   const el = ev.target.closest('[data-act]');
   if (!el || el.disabled) return;
@@ -1268,7 +1282,7 @@ document.addEventListener('click', async (ev) => {
     case 'modal-close':
       if (S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop') && S.queue.length) {
         S.modal = null; render(); processNext();
-      } else if (S.scan && S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop') && !S.modal.editId) {
+      } else if (S.scan && S.modal && (S.modal.kind === 'receipt' || S.modal.type === 'crop' || S.modal.type === 'supplierAsk') && !S.modal.editId) {
         // Beleg aus der Scan-Runde verworfen: zurück zur Kamera, denselben Code dabei nicht gleich wieder öffnen.
         if (S.modal.rksvKey) S.scan.skipKey = S.modal.rksvKey;
         openScanner(S.scan.count);
@@ -1278,6 +1292,7 @@ document.addEventListener('click', async (ev) => {
       }
       break;
     case 'entry-save': saveEntry(); break;
+    case 'sup-ask-ok': confirmSupplierAsk(); break;
     case 'crop-use': useCrop(false); break;
     case 'crop-pick': {
       const m = S.modal;
