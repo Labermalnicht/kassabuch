@@ -1,5 +1,5 @@
 // Offline-Fähigkeit: Die App-Dateien werden zwischengespeichert und im Hintergrund aktualisiert.
-const CACHE = 'kassabuch-v24';
+const CACHE = 'kassabuch-v25';
 const FILES = [
   './',
   './index.html',
@@ -12,6 +12,7 @@ const FILES = [
   './js/image.js',
   './js/ledger.js',
   './js/link.js',
+  './js/localai.js',
   './js/ocr.js',
   './js/rksv.js',
   './js/scanner.js',
@@ -36,7 +37,8 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && k !== CDN_CACHE).map((k) => caches.delete(k))))
+      // Nur eigene alte Stände löschen; der Modellspeicher der lokalen Texterkennung (transformers-cache) bleibt.
+      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('kassabuch-') && k !== CACHE && k !== CDN_CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim()),
   );
 });
@@ -45,7 +47,10 @@ self.addEventListener('activate', (event) => {
 // Fremde Adressen (Claude-API, Texterkennung) laufen direkt über das Netz.
 // Texterkennung und Excel-Bibliothek vom CDN: einmal laden, danach aus dem Zwischenspeicher (versionierte Adressen).
 const CDN_CACHE = 'kassabuch-cdn-v1';
-const isCdnAsset = (url) => url.hostname === 'cdn.jsdelivr.net' && /tesseract|exceljs|jsqr|peerjs|qrcode-generator/.test(url.pathname);
+// Dazu die kleinen Modelle der Standard-Texterkennung (PaddleOCR), damit sie auch offline funktioniert.
+const isCdnAsset = (url) => (url.hostname === 'cdn.jsdelivr.net'
+  && /tesseract|exceljs|jsqr|peerjs|qrcode-generator|ppu-paddle-ocr|ppu-ocv|onnxruntime/.test(url.pathname))
+  || (url.hostname === 'huggingface.co' && url.pathname.startsWith('/snowfluke/ppu-paddle-ocr-models/'));
 
 self.addEventListener('fetch', (event) => {
   const req = event.request;

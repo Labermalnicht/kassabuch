@@ -2,6 +2,7 @@
 import { t } from './i18n.js';
 import { KNOWN_CHAINS, findLearned, suggest, similarity, chainByUid } from './templates.js';
 import { parseAmount, todayISO } from './ledger.js';
+import { paddleText, vlmFields } from './localai.js';
 
 const SDK_URL = 'https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.128.0/+esm';
 const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
@@ -210,6 +211,50 @@ export async function recognizeOffline(canvas, biz, onProgress, altCanvas) {
   const second = parseReceiptText((await worker.recognize(altCanvas)).data.text || '', biz);
   const filled = (r) => [r.amount, r.date, r.ref, r.supplier].filter(Boolean).length;
   return filled(second) > filled(first) ? second : first;
+}
+
+/**
+ * Kostenlose Erkennung auf dem Gerät. img: Ergebnis von prepareImage.
+ * PaddleOCR liest den Text; nur wenn das nicht klappt, die ältere Tesseract-Erkennung. Mit vlm: true prüft das
+ * Bildsprachmodell auf der Grafikkarte Lieferant, Betrag und Datum gegen.
+ * Ergebnis wie recognizeOffline, dazu engine ('paddle', 'tesseract', mit '+vlm') und vlmMs (Rechenzeit).
+ */
+export async function recognizeLocal(img, biz, { onProgress, vlm = false, onVlmProgress } = {}) {
+  let res = null;
+  try {
+    res = parseReceiptText(await paddleText(img.src), biz);
+    res.engine = 'paddle';
+  } catch (e) { console.warn('PaddleOCR', e); }
+  if (!res || (!res.amount && !res.date)) {
+    const tess = await recognizeOffline(img.ocrCanvas, biz, onProgress, img.ocrCanvasAlt);
+    tess.engine = 'tesseract';
+    const filled = (r) => [r.amount, r.date, r.ref, r.supplier].filter(Boolean).length;
+    if (!res || filled(tess) > filled(res)) res = tess;
+  }
+  if (vlm) {
+    try {
+      const v = await vlmFields(img.src, onVlmProgress);
+      res.vlmMs = v.ms;
+      res.engine += '+vlm';
+      mergeVlm(res, v);
+    } catch (e) {
+      console.warn('Bildsprachmodell', e);
+      res.vlmError = true;
+    }
+  }
+  return res;
+}
+
+// Ergebnis des Bildsprachmodells mit dem gelesenen Text abgleichen. Das Modell versteht den Beleg gut (welcher Betrag
+// der Endbetrag ist, wie das Geschäft heißt), irrt sich aber bei einzelnen Ziffern. Darum: Betrag nur, wenn er fehlt
+// oder genau so auf dem Beleg steht; Datum nur, wenn keins gelesen wurde; Lieferant, wenn keiner gelernt ist.
+function mergeVlm(res, v) {
+  if (v.amount) {
+    if (!res.amount) res.amount = v.amount;
+    else if (v.amount !== res.amount && amountsIn(res.text || '').includes(v.amount)) res.amount = v.amount;
+  }
+  if (v.date && !res.date && plausibleDate(v.date)) res.date = v.date;
+  if (v.supplier && !res.known) res.supplier = v.supplier;
 }
 
 // Betrag mit zwei Nachkommastellen. Nicht Teil eines Datums ("18.09.2026"), keiner längeren Zahl und kein Prozentsatz.

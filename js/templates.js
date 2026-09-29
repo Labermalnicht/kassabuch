@@ -121,12 +121,24 @@ const PRESETS = [
 export const KNOWN_CHAINS = PRESETS.map((p) => p.re);
 
 // Konzerne, die die Kassen mehrerer Ketten unter einer gemeinsamen UID signieren (Ordnungsbegriff im QR-Code).
-// Die Endung nach dem Bindestrich unterscheidet die Gesellschaften; bestätigte Endungen stehen in known.
+// Die Endung unterscheidet die Ketten nicht (BILLA und BIPA tragen beide "U:ATU59193205-001"), daher gilt ein
+// solcher Eintrag nie als Merkmal einer bestimmten Kette. Die Kette ergibt sich aus Name oder UID auf dem Beleg.
 const RKSV_GROUPS = {
-  ATU59193205: { group: 'REWE Group', chains: ['BILLA', 'PENNY', 'BIPA'], known: { '001': 'BILLA' } },
+  ATU59193205: { group: 'REWE Group', chains: ['BILLA', 'PENNY', 'BIPA'] },
 };
 
-const presetOf = (name) => PRESETS.find((p) => p.name === name) || null;
+/** true, wenn der Zertifikats-Eintrag einem ganzen Konzern gehört (kein Merkmal einer einzelnen Kette). */
+export function isGroupCert(cert) {
+  const m = String(cert || '').toUpperCase().match(/^U:(ATU\d{8})/);
+  return !!(m && RKSV_GROUPS[m[1]]);
+}
+
+/** Ketten des Konzerns zu einem Zertifikats-Eintrag, sonst leer. */
+export function groupChains(cert) {
+  const m = String(cert || '').toUpperCase().match(/^U:(ATU\d{8})/);
+  return (m && RKSV_GROUPS[m[1]] && RKSV_GROUPS[m[1]].chains) || [];
+}
+
 const catFor = (biz, p) => (p ? p.cats.find((c) => biz.categories.includes(c)) || null : null);
 
 /** Kette zu einer UID-Nummer (z. B. "ATU15255907"), sonst null. */
@@ -141,13 +153,10 @@ export function chainByUid(biz, uid) {
  * Ergebnis: { name, cat } bei eindeutiger Zuordnung, { group, chains } wenn nur der Konzern bekannt ist, sonst null.
  */
 export function chainByRksv(biz, cert) {
-  const m = String(cert || '').toUpperCase().match(/^U:(ATU\d{8})(?:-(\w+))?/);
+  const m = String(cert || '').toUpperCase().match(/^U:(ATU\d{8})/);
   if (!m) return null;
   const g = RKSV_GROUPS[m[1]];
-  if (g) {
-    const name = m[2] && g.known[m[2]];
-    return name ? { name, cat: catFor(biz, presetOf(name)) } : { group: g.group, chains: g.chains };
-  }
+  if (g) return { group: g.group, chains: g.chains };
   return chainByUid(biz, m[1]);
 }
 

@@ -1,6 +1,6 @@
 import * as db from './db.js';
 import { t, setLang, getLang } from './i18n.js';
-import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest, similarity, chainByRksv } from './templates.js';
+import { TEMPLATES, BRANCHES, CASH_IN, CASH_OUT, MONTHS_DE, BOOK, normKey, suggest, similarity, chainByRksv, isGroupCert, groupChains } from './templates.js';
 import {
   parseAmount, fmtMoney, fmtAmountInput, fmtDate, fmtDay, fmtMonth, shiftMonth,
   withBalances, currentBalance, todayISO, uid,
@@ -14,6 +14,7 @@ import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js
 import {
   PAIR_PREFIX, newPcId, qrSvg, hostPc, connectPc, disconnectPc, pcConnected, sendToPc,
 } from './link.js';
+import { detectGpu, VLM_SIZE, VLM_SLOW_MS } from './localai.js';
 
 const APP_VERSION = '1.0.0';
 const app = document.getElementById('app');
@@ -39,6 +40,28 @@ const S = {
 };
 
 const isDesktop = () => window.matchMedia('(pointer: fine)').matches;
+
+// Kostenlose Erkennung: am PC mit starker Grafikkarte zusätzlich das Bildsprachmodell, sonst nur PaddleOCR.
+// Einstellung localEngine: 'auto' (Standard), 'standard' oder 'gpu'.
+async function useVlm() {
+  if (!isDesktop() || !navigator.gpu) return false;
+  const pref = S.settings.localEngine || 'auto';
+  if (pref !== 'auto') return pref === 'gpu';
+  if (S.settings.gpuSlow) return false;
+  return (await detectGpu()).tier === 'gpu';
+}
+
+// War das Modell bei einem Beleg zu langsam (der erste zählt nicht, da wird noch vorbereitet), künftig ohne.
+let vlmRuns = 0;
+async function checkVlmSpeed(res) {
+  if (!res || !res.vlmMs) return;
+  vlmRuns++;
+  if (vlmRuns > 1 && res.vlmMs > VLM_SLOW_MS && (S.settings.localEngine || 'auto') === 'auto' && !S.settings.gpuSlow) {
+    S.settings.gpuSlow = true;
+    await saveSettings();
+    showToast(t('ocr.gpuSlow'), 'warn');
+  }
+}
 
 // ---------- Hilfsfunktionen ----------
 
@@ -331,6 +354,17 @@ function viewExport() {
 </section>`;
 }
 
+// Was die automatische Wahl der kostenlosen Erkennung ergeben hat (S.gpu wird beim Start ermittelt).
+function localEngineHint() {
+  const pref = S.settings.localEngine || 'auto';
+  if (!isDesktop()) return t('set.localPhone');
+  if (pref === 'gpu') return t('set.localGpuForced', { size: VLM_SIZE });
+  if (pref === 'standard') return t('set.localStandard');
+  if (S.settings.gpuSlow) return t('set.localSlow');
+  if (S.gpu && S.gpu.tier === 'gpu') return t('set.localAutoGpu', { name: S.gpu.name, size: VLM_SIZE });
+  return t('set.localAutoStd', { name: (S.gpu && S.gpu.name) || t('set.localNoGpu') });
+}
+
 function viewSettings() {
   const b = S.biz;
   const hasKey = !!S.settings.apiKey;
@@ -388,6 +422,10 @@ function viewSettings() {
     <select data-set-global="model">${ocr.MODELS.map((m) => `<option value="${m.id}" ${m.id === S.settings.model ? 'selected' : ''}>${m.label} · ${esc(t(m.noteKey))}</option>`).join('')}</select>
   </label>
   <p class="hint">${t('set.keyHint')}</p>
+  <label class="field"><span class="lbl">${t('set.localEngine')}</span>
+    <select data-set-global="localEngine">${['auto', 'standard', 'gpu'].map((v) => `<option value="${v}" ${(S.settings.localEngine || 'auto') === v ? 'selected' : ''}>${t('set.local.' + v)}</option>`).join('')}</select>
+  </label>
+  <p class="hint">${localEngineHint()}</p>
 </section>
 
 <section class="card pad">
@@ -509,7 +547,8 @@ ${n ? `<h3 class="sec-title">${t('pc.inbox', { n })}</h3>
     title = t('rev.title');
     if (m.busy) {
       body = `<div class="ocr run"><span class="spinner"></span><span>${t('rev.progress', { i: Math.min(m.done + 1, m.total), n: m.total })}</span></div>
-<div class="progress"><span style="width:${Math.round((m.done / m.total) * 100)}%"></span></div>`;
+<div class="progress"><span style="width:${Math.round((m.done / m.total) * 100)}%"></span></div>
+${m.vlmPct != null ? `<p class="hint">${t('ocr.vlmLoading', { size: VLM_SIZE, p: m.vlmPct })}</p>` : ''}`;
       foot = '';
     } else {
       const names = [...new Set([...Object.values(S.biz.suppliers || {}).map((x) => x.name), ...m.rows.flatMap((r) => r.chains || [])])].sort((a, b) => a.localeCompare(b));
@@ -573,7 +612,7 @@ function reviewRow(r, i) {
     r.dup ? `<span class="tag warn">${t('rev.dup')}</span>` : '',
     r.needSupplier ? `<span class="tag warn">${t('rev.needSupplier')}</span>` : '',
     r.error ? `<span class="tag err">${t('rev.error')}</span>` : '',
-    !r.error && r.invalid ? `<span class="tag err">${t('rev.incomplete')}</span>` : '',
+    !r.error && r.invalid && !(r.needSupplier && parseAmount(r.amount) > 0 && r.date) ? `<span class="tag err">${t('rev.incomplete')}</span>` : '',
   ].join('');
   const bad = (k) => (r.invalid && ((k === 'party' && !r.party.trim()) || (k === 'amount' && !(parseAmount(r.amount) > 0)) || (k === 'date' && !r.date)) ? ' bad' : '');
   return `<div class="rev-row${r.on ? '' : ' off'}${r.zoom ? ' zoom' : ''}" data-row="${i}">
@@ -960,10 +999,13 @@ async function recognizePhoto(file, queuePos = '') {
   }
   if (!res) {
     try {
-      res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, (p) => {
-        const el = alive() && document.getElementById('ocr-progress');
-        if (el) el.textContent = `${Math.round(p * 100)} %`;
-      }, img.ocrCanvasAlt);
+      const progressEl = () => alive() && document.getElementById('ocr-progress');
+      res = await ocr.recognizeLocal(img, S.biz, {
+        vlm: await useVlm(),
+        onProgress: (p) => { const el = progressEl(); if (el) el.textContent = `${Math.round(p * 100)} %`; },
+        onVlmProgress: (p) => { const el = progressEl(); if (el) el.textContent = t('ocr.vlmLoading', { size: VLM_SIZE, p: Math.round(p * 100) }); },
+      });
+      checkVlmSpeed(res);
     } catch (err) {
       console.warn('Offline-Erkennung fehlgeschlagen', err);
       if (alive()) { syncModal(); m.ocr = { status: 'error', msg: err.message || t('ocr.failed'), note }; renderModal(); }
@@ -1039,7 +1081,8 @@ function learnSupplier(e, meta) {
   }
   // Merkmale aus dem RKSV-Code: dieselbe Kasse oder dasselbe Unternehmen liefert beim nächsten Scan sofort den Lieferanten.
   if (meta.kassenId) {
-    learned.ids = mergeIds(learned.ids || old.ids, [`KASSE:${meta.kassenId}`, ...(meta.rksvCert ? [`RKSV:${meta.rksvCert}`] : [])]);
+    const cert = meta.rksvCert && !isGroupCert(meta.rksvCert) ? [`RKSV:${meta.rksvCert}`] : [];
+    learned.ids = mergeIds(learned.ids || old.ids, [`KASSE:${meta.kassenId}`, ...cert]);
   }
   Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
   sup[normKey(e.party)] = learned;
@@ -1236,7 +1279,8 @@ function mergeIds(oldIds, add) {
 }
 
 // Merkmale eines RKSV-Codes: die Kasse und das Unternehmen (Ordnungsbegriff bzw. Zertifikat, gleich für alle Filialen).
-const rksvIds = (q) => [`KASSE:${q.kassenId}`, ...(q.cert ? [`RKSV:${q.cert}`] : [])];
+// Ein Konzern-Eintrag (mehrere Ketten unter einer UID) ist kein Merkmal einer bestimmten Kette und wird nicht gemerkt.
+const rksvIds = (q) => [`KASSE:${q.kassenId}`, ...(q.cert && !isGroupCert(q.cert) ? [`RKSV:${q.cert}`] : [])];
 
 function kassenProfile(q) {
   const ids = rksvIds(q);
@@ -1476,7 +1520,19 @@ async function draftsFromItem(item) {
         res = list[0] || null;
       } catch (e) { console.warn('Claude', e); }
     }
-    if (!res) res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, null, img.ocrCanvasAlt);
+    if (!res) {
+      // Beim ersten Mal lädt das Grafikkarten-Modell; den Fortschritt im Prüffenster zeigen.
+      res = await ocr.recognizeLocal(img, S.biz, {
+        vlm: await useVlm(),
+        onVlmProgress: (p) => {
+          if (!S.modal || S.modal.type !== 'review' || !S.modal.busy) return;
+          const pct = Math.round(p * 100);
+          if (pct !== S.modal.vlmPct) { S.modal.vlmPct = pct; renderModal(); }
+        },
+      });
+      if (S.modal && S.modal.type === 'review') S.modal.vlmPct = null;
+      checkVlmSpeed(res);
+    }
     const m = { data: { date: todayISO(), party: '', desc: S.biz.categories[0] || '', ref: '', amount: '' }, touched: new Set() };
     let needSupplier = false;
     let chains = [];
@@ -1490,8 +1546,16 @@ async function draftsFromItem(item) {
         m.data.party = known.name;
         if (known.cat && S.biz.categories.includes(known.cat)) { m.data.desc = known.cat; m.touched.add('desc'); }
       } else {
-        needSupplier = true;
-        chains = (chain && chain.chains) || [];
+        // Konzern-Eintrag (z. B. REWE): die Kette ergibt sich aus Name oder UID auf dem Beleg, sonst nachfragen.
+        const group = groupChains(q.cert);
+        const sug = group.length && res.supplier ? suggest(S.biz, res.supplier) : null;
+        if (sug && group.includes(sug.name)) {
+          m.data.party = sug.name;
+          if (sug.cat) { m.data.desc = sug.cat; m.touched.add('desc'); }
+        } else {
+          needSupplier = true;
+          chains = group;
+        }
       }
       m.touched.add('party');
     }
@@ -2004,8 +2068,11 @@ document.addEventListener('change', async (ev) => {
   }
   if (el.dataset.setGlobal) {
     S.settings[el.dataset.setGlobal] = el.value;
+    // Neue Wahl der Erkennung: eine frühere Einstufung "zu langsam" gilt nicht mehr.
+    if (el.dataset.setGlobal === 'localEngine') S.settings.gpuSlow = false;
     await saveSettings();
     showToast(t('toast.settingsSaved'), 'ok');
+    if (el.dataset.setGlobal === 'localEngine') render();
     return;
   }
   if (el.dataset.setUi === 'exportYear') {
@@ -2022,12 +2089,24 @@ async function init() {
   else S.settings.lang = (navigator.language || 'de').toLowerCase().startsWith('en') ? 'en' : 'de';
   setLang(S.settings.lang);
   S.businesses = (await db.getAll('businesses')).sort((a, b) => a.created - b.created);
+  // Version 23 hat den REWE-Konzerneintrag aus dem QR-Code als Merkmal von BILLA gespeichert. Er gilt aber für
+  // mehrere Ketten (auch BIPA) und wird deshalb wieder entfernt.
+  for (const b of S.businesses) {
+    let changed = false;
+    for (const s of Object.values(b.suppliers || {})) {
+      const ids = (s.ids || []).filter((id) => !(id.startsWith('RKSV:') && isGroupCert(id.slice(5))));
+      if (ids.length !== (s.ids || []).length) { s.ids = ids; changed = true; }
+    }
+    if (changed) await db.put('businesses', b);
+  }
   const active = S.businesses.find((b) => b.id === S.settings.activeBiz) || S.businesses[0];
   if (active) await selectBiz(active.id);
   S.inbox = (await db.getAll('inbox')).sort((a, b) => a.at - b.at);
   render();
   // PC: war schon einmal ein Handy gekoppelt, gleich empfangsbereit sein (auch ohne das Fenster zu öffnen).
   if (S.settings.pcId && S.businesses.length && isDesktop()) startPcReceive();
+  // Grafikkarte einmal einstufen (für die automatische Wahl der kostenlosen Erkennung).
+  if (isDesktop()) detectGpu().then((g) => { S.gpu = g; if (S.view === 'settings' && !S.modal) render(); });
   if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
     navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('Service Worker', e));
   }
