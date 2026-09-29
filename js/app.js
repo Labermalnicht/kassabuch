@@ -11,6 +11,9 @@ import { scanRksv } from './rksv.js';
 import { startScanner, stopScanner, attachScanner } from './scanner.js';
 import * as ocr from './ocr.js';
 import { exportYear, readBackup, yearsOf, yearInfo, XLSX_MIME } from './excel.js';
+import {
+  PAIR_PREFIX, newPcId, qrSvg, hostPc, connectPc, disconnectPc, pcConnected, sendToPc,
+} from './link.js';
 
 const APP_VERSION = '1.0.0';
 const app = document.getElementById('app');
@@ -29,7 +32,13 @@ const S = {
   queueDone: 0,
   scan: null, // laufende Scan-Runde { count }
   busy: false,
+  inbox: [], // PC: vom Handy empfangene Belegfotos { id, blob, boxes, rksv, at }
+  pcStatus: '', // PC: Empfangsbereitschaft
+  pcQr: '', // PC: Kopplungs-QR-Code (SVG)
+  link: 'off', // Handy: Verbindung zum PC ('off' | 'connecting' | 'connected')
 };
+
+const isDesktop = () => window.matchMedia('(pointer: fine)').matches;
 
 // ---------- Hilfsfunktionen ----------
 
@@ -153,7 +162,10 @@ const monthDiff = (a, b) => {
 
 function render() {
   if (!S.businesses.length) {
-    app.innerHTML = viewOnboarding() + hiddenInputs();
+    // Ohne Betrieb: Einrichtung, oder das Handy dient nur als Kamera für den PC.
+    app.innerHTML = `${S.settings.cameraOnly ? viewCameraOnly() : viewOnboarding()}${hiddenInputs()}<div id="modal-root">${S.modal ? viewModal() : ''}</div>`;
+    document.body.classList.toggle('modal-open', !!S.modal);
+    syncScanner();
     return;
   }
   const main = S.view === 'export' ? viewExport() : S.view === 'settings' ? viewSettings() : viewHome();
@@ -220,10 +232,14 @@ function viewHome() {
     banners += banner('warn', lastExport ? t('home.backupOld') : t('home.backupNone'),
       `<button class="btn small" data-act="nav:export">${t('home.backupNow')}</button>`);
   }
+  if (S.inbox.length) {
+    banners += banner('ok', t('pc.banner', { n: S.inbox.length }), `<button class="btn small" data-act="inbox-read">${t('pc.bannerBtn')}</button>`);
+  }
 
   const act = (a, ic, label, cls = '') => `<button class="act ${cls}" data-act="${a}">${icon(ic)}<span>${label}</span></button>`;
   const actions = [
-    act('qr-scan', 'camera', t('act.scan'), 'primary wide'),
+    // Am PC steht das Empfangen vom Handy vorne, am Handy das Scannen.
+    isDesktop() ? act('pc-receive', 'qr', t('act.pcReceive'), 'primary wide') : act('qr-scan', 'camera', t('act.scan'), 'primary wide'),
     act('receipt-camera', 'image', t('act.camera')),
     act('receipt-gallery', 'image', t('act.gallery')),
     act('new:takings', 'cash', t('act.takings')),
@@ -375,6 +391,15 @@ function viewSettings() {
 </section>
 
 <section class="card pad">
+  <h2 class="sec-title">${t('set.pc')}</h2>
+  <p class="hint">${S.settings.pcLink ? t('set.pcPaired') : t('set.pcNone')}</p>
+  <div class="btn-row">
+    <button class="btn" data-act="pc-receive">${icon('qr')}<span>${t('set.pcReceive')}</span></button>
+    ${S.settings.pcLink ? `<button class="btn" data-act="pc-unpair">${t('set.pcUnpair')}</button>` : ''}
+  </div>
+</section>
+
+<section class="card pad">
   <h2 class="sec-title">${t('set.language')}</h2>
   <div class="seg">
     <button class="${getLang() === 'de' ? 'on' : ''}" data-act="lang:de">Deutsch</button>
@@ -423,6 +448,19 @@ function viewOnboarding() {
     <button class="btn primary block" data-act="onb-create">${t('onb.create')}</button>
   </section>
   <button class="btn ghost block" data-act="backup-import">${icon('upload')}<span>${t('onb.restore')}</span></button>
+  <button class="btn ghost block" data-act="camera-only">${icon('camera')}<span>${t('onb.cameraOnly')}</span></button>
+</main>`;
+}
+
+// Handy nur als Kamera: fotografiert die Bons und schickt sie an die App am PC.
+function viewCameraOnly() {
+  const paired = !!S.settings.pcLink;
+  return `<main class="main onboarding">
+  <div class="brand">${icon('camera')}<h1>${t('cam.title')}</h1><p>${t('cam.text')}</p></div>
+  <button class="btn primary block big" data-act="qr-scan">${icon('camera')}<span>${t('cam.open')}</span></button>
+  <p class="hint center">${paired ? t('cam.statusPaired') : t('cam.statusNone')}</p>
+  ${paired ? `<button class="btn ghost block" data-act="pc-unpair">${t('cam.unpair')}</button>` : ''}
+  <button class="btn ghost block" data-act="camera-back">${t('cam.back')}</button>
 </main>`;
 }
 
@@ -444,11 +482,43 @@ function viewModal() {
     const n = m.rows.filter((r) => r.on && parseAmount(r.amount) > 0).length;
     foot = `<button class="btn primary grow" data-act="salary-save" ${n ? '' : 'disabled'}>${t('salary.book', { n })}</button>`;
   } else if (m.type === 'scan') {
-    title = t('scan.title') + (m.count ? ` (${t('scan.count', { n: m.count })})` : '');
+    title = scanTitle(m.count);
+    const hint = S.settings.pcLink ? t(S.link === 'connected' ? 'scan.paired' : 'scan.pcConnecting')
+      : S.settings.cameraOnly ? t('scan.needPc') : t('scan.hint');
     body = `<div class="scan-wrap"><video id="scan-video" playsinline muted autoplay></video><div class="scan-boxes" id="scan-boxes"></div></div>
-<p class="scan-status" id="scan-status" role="status">${t('scan.hint')}</p>`;
-    foot = `<button class="btn" data-act="scan-photo">${icon('camera')}<span>${t('scan.photo')}</span></button>
+<p class="scan-status" id="scan-status" role="status">${hint}</p>`;
+    foot = S.settings.pcLink || S.settings.cameraOnly
+      ? `${S.settings.pcLink ? `<button class="btn" data-act="pc-unpair">${t('scan.unpair')}</button>` : ''}
+      <button class="btn primary grow" data-act="scan-done">${t('scan.done')}</button>`
+      : `<button class="btn" data-act="scan-photo">${icon('camera')}<span>${t('scan.photo')}</span></button>
       <button class="btn primary grow" data-act="scan-done">${t('scan.done')}</button>`;
+  } else if (m.type === 'pcRecv') {
+    title = t('pc.title');
+    const st = S.pcStatus || 'starting';
+    const n = S.inbox.length;
+    body = `<div class="pc-pair">
+  <div class="pc-qr">${S.pcQr || '<span class="spinner"></span>'}</div>
+  <div><p class="pc-status ${st}" role="status">${t('pc.status.' + st)}</p><p class="hint">${t('pc.hint')}</p></div>
+</div>
+${n ? `<h3 class="sec-title">${t('pc.inbox', { n })}</h3>
+<div class="pc-grid">${S.inbox.map((x) => `<div class="pc-thumb"><img src="${inboxUrl(x)}" alt="">
+  <button class="icon-btn" data-act="inbox-del:${esc(x.id)}" aria-label="${esc(t('pc.remove'))}">${icon('x')}</button></div>`).join('')}</div>`
+    : `<p class="empty">${t('pc.inboxEmpty')}</p>`}`;
+    foot = `<button class="btn primary grow" data-act="inbox-read" ${n ? '' : 'disabled'}>${icon('check')}<span>${t('pc.read', { n })}</span></button>`;
+  } else if (m.type === 'review') {
+    title = t('rev.title');
+    if (m.busy) {
+      body = `<div class="ocr run"><span class="spinner"></span><span>${t('rev.progress', { i: Math.min(m.done + 1, m.total), n: m.total })}</span></div>
+<div class="progress"><span style="width:${Math.round((m.done / m.total) * 100)}%"></span></div>`;
+      foot = '';
+    } else {
+      const names = [...new Set([...Object.values(S.biz.suppliers || {}).map((x) => x.name), ...m.rows.flatMap((r) => r.chains || [])])].sort((a, b) => a.localeCompare(b));
+      body = `<p class="hint">${t('rev.hint')}</p>
+<datalist id="rev-sup">${names.map((x) => `<option value="${esc(x)}"></option>`).join('')}</datalist>
+<div class="rev-list">${m.rows.map(reviewRow).join('')}</div>`;
+      const on = m.rows.filter((r) => r.on).length;
+      foot = `<button class="btn primary grow" data-act="rev-save" id="rev-save" ${on ? '' : 'disabled'}>${icon('check')}<span>${t('rev.save', { n: on })}</span></button>`;
+    }
   } else if (m.type === 'crop') {
     title = t('crop.title') + (m.queuePos ? ` (${m.queuePos})` : '');
     const f = m.found || [];
@@ -484,11 +554,40 @@ ${field(t('f.supplier'), `<input type="text" id="sup-ask-input" list="sup-ask-li
     body = bizFormFields('nb');
     foot = `<button class="btn primary grow" data-act="biz-create">${t('onb.create')}</button>`;
   }
-  return `<div class="overlay"><div class="sheet" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+  return `<div class="overlay"><div class="sheet${m.type === 'review' || m.type === 'pcRecv' ? ' wide' : ''}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
   <div class="sheet-head"><button class="icon-btn" data-act="modal-close" aria-label="${esc(t('close'))}">${icon('x')}</button><h2>${esc(title)}</h2><span class="spacer"></span></div>
   <div class="sheet-body">${body}</div>
   <div class="sheet-foot">${foot}</div>
 </div></div>`;
+}
+
+const scanTitle = (n) => (S.settings.pcLink ? t('scan.titlePc') + (n ? ` (${t('scan.countPc', { n })})` : '')
+  : t('scan.title') + (n ? ` (${t('scan.count', { n })})` : ''));
+
+// Eine Zeile der Prüftabelle: Foto, Felder, Hinweise.
+function reviewRow(r, i) {
+  const cats = [...S.biz.categories];
+  if (r.desc && !cats.includes(r.desc)) cats.push(r.desc);
+  const tags = [
+    r.rksv ? `<span class="tag ok">${t('rev.qr')}</span>` : '',
+    r.dup ? `<span class="tag warn">${t('rev.dup')}</span>` : '',
+    r.needSupplier ? `<span class="tag warn">${t('rev.needSupplier')}</span>` : '',
+    r.error ? `<span class="tag err">${t('rev.error')}</span>` : '',
+    !r.error && r.invalid ? `<span class="tag err">${t('rev.incomplete')}</span>` : '',
+  ].join('');
+  const bad = (k) => (r.invalid && ((k === 'party' && !r.party.trim()) || (k === 'amount' && !(parseAmount(r.amount) > 0)) || (k === 'date' && !r.date)) ? ' bad' : '');
+  return `<div class="rev-row${r.on ? '' : ' off'}${r.zoom ? ' zoom' : ''}" data-row="${i}">
+  <label class="rev-check"><input type="checkbox" data-r="on" ${r.on ? 'checked' : ''} aria-label="${esc(t('rev.take'))}"></label>
+  <button type="button" class="rev-img" data-act="rev-zoom:${i}" aria-label="${esc(t('rev.zoom'))}"><img src="${r.thumb}" alt=""></button>
+  <div class="rev-fields">
+    <input type="date" data-r="date" value="${esc(r.date)}" aria-label="${esc(t('f.date'))}" class="${bad('date')}">
+    <input type="text" data-r="party" list="rev-sup" value="${esc(r.party)}" placeholder="${esc(t('f.supplier'))}" aria-label="${esc(t('f.supplier'))}" class="${bad('party')}" autocomplete="off">
+    <select data-r="desc" aria-label="${esc(t('f.category'))}">${cats.map((c) => `<option ${c === r.desc ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
+    <input type="text" data-r="ref" value="${esc(r.ref)}" placeholder="${esc(t('f.ref'))}" aria-label="${esc(t('f.ref'))}" autocomplete="off">
+    <div class="money${bad('amount')}"><input type="text" inputmode="decimal" data-r="amount" value="${esc(r.amount)}" placeholder="0,00" aria-label="${esc(t('f.amount'))}" autocomplete="off"><span>€</span></div>
+  </div>
+  ${tags ? `<div class="rev-tags">${tags}</div>` : ''}
+</div>`;
 }
 
 const field = (label, inner, hint = '') => `<label class="field"><span class="lbl">${label}</span>${inner}${hint ? `<span class="hint">${hint}</span>` : ''}</label>`;
@@ -637,6 +736,11 @@ function syncModal() {
   if (m.type === 'entry') {
     root.querySelectorAll('[data-f]').forEach((el) => { m.data[el.dataset.f] = el.value; });
     root.querySelectorAll('[data-part]').forEach((el) => { m.data.parts[Number(el.dataset.part)] = el.value; });
+  } else if (m.type === 'review' && !m.busy) {
+    root.querySelectorAll('[data-row]').forEach((rowEl) => {
+      const r = m.rows[Number(rowEl.dataset.row)];
+      rowEl.querySelectorAll('[data-r]').forEach((el) => { r[el.dataset.r] = el.type === 'checkbox' ? el.checked : el.value; });
+    });
   } else if (m.type === 'salary') {
     root.querySelectorAll('[data-sal]').forEach((el) => {
       m[el.dataset.sal] = el.value;
@@ -920,6 +1024,29 @@ function applyRecognition(m, res) {
 
 // ---------- Speichern ----------
 
+// Lieferantenprofil: Name, Kategorie, Häufigkeit und was sich aus dem Foto über den Aufbau des Belegs lernen lässt.
+// meta: { ocrText, ocrSupplier, kassenId, rksvCert }. Speichert nicht selbst (saveBiz danach).
+function learnSupplier(e, meta) {
+  const sup = { ...(S.biz.suppliers || {}) };
+  const old = Object.values(sup).find((s) => s.name === e.party) || {};
+  const learned = { ...old, name: e.party, cat: e.desc, count: (old.count || 0) + 1 };
+  if (e.kind === 'receipt' && meta.ocrText) {
+    const l = ocr.learnFromReceipt(meta.ocrText, { ref: e.ref, amount: e.amount });
+    if (l.refLabel) learned.refLabel = l.refLabel;
+    if (l.totalLabel) learned.totalLabel = l.totalLabel;
+    if (l.refTail) learned.refTail = l.refTail;
+    learned.ids = mergeIds(old.ids, l.ids);
+  }
+  // Merkmale aus dem RKSV-Code: dieselbe Kasse oder dasselbe Unternehmen liefert beim nächsten Scan sofort den Lieferanten.
+  if (meta.kassenId) {
+    learned.ids = mergeIds(learned.ids || old.ids, [`KASSE:${meta.kassenId}`, ...(meta.rksvCert ? [`RKSV:${meta.rksvCert}`] : [])]);
+  }
+  Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
+  sup[normKey(e.party)] = learned;
+  if (meta.ocrSupplier && normKey(meta.ocrSupplier) !== normKey(e.party)) sup[normKey(meta.ocrSupplier)] = learned;
+  S.biz.suppliers = sup;
+}
+
 async function saveEntry() {
   syncModal();
   const m = S.modal;
@@ -976,25 +1103,7 @@ async function saveEntry() {
     await saveBiz();
   }
   if (kind === 'receipt' || (kind === 'manual' && e.dir === 'out' && S.biz.categories.includes(e.desc))) {
-    // Lieferantenprofil: Name, Kategorie, Häufigkeit und was sich aus dem Foto über den Aufbau des Belegs lernen lässt.
-    const sup = { ...(S.biz.suppliers || {}) };
-    const old = Object.values(sup).find((s) => s.name === e.party) || {};
-    const learned = { ...old, name: e.party, cat: e.desc, count: (old.count || 0) + 1 };
-    if (kind === 'receipt' && m.ocrText) {
-      const l = ocr.learnFromReceipt(m.ocrText, { ref: e.ref, amount: e.amount });
-      if (l.refLabel) learned.refLabel = l.refLabel;
-      if (l.totalLabel) learned.totalLabel = l.totalLabel;
-      if (l.refTail) learned.refTail = l.refTail;
-      learned.ids = mergeIds(old.ids, l.ids);
-    }
-    // Merkmale aus dem RKSV-Code: dieselbe Kasse oder dasselbe Unternehmen liefert beim nächsten Scan sofort den Lieferanten.
-    if (m.kassenId) {
-      learned.ids = mergeIds(learned.ids || old.ids, [`KASSE:${m.kassenId}`, ...(m.rksvCert ? [`RKSV:${m.rksvCert}`] : [])]);
-    }
-    Object.keys(sup).forEach((k) => { if (sup[k].name === e.party) sup[k] = learned; });
-    sup[normKey(e.party)] = learned;
-    if (m.ocrSupplier && normKey(m.ocrSupplier) !== normKey(e.party)) sup[normKey(m.ocrSupplier)] = learned;
-    S.biz.suppliers = sup;
+    learnSupplier(e, m);
     await saveBiz();
   }
   db.requestPersistence();
@@ -1037,12 +1146,39 @@ async function openScanner(count = 0, fresh = false) {
   let lastOther = 0;
   let lastDup = '';
   let holding = false;
+  // Gekoppelt mit einem PC: im Hintergrund verbinden; jeder Bon geht dann direkt an den PC.
+  if (S.settings.pcLink && !pcConnected()) linkToPc(S.settings.pcLink);
+  const pcMode = () => !!(S.settings.pcLink || S.settings.cameraOnly);
+  const sent = S.scan.sent || (S.scan.sent = new Set());
+  const send = async (frame, boxes, q) => {
+    if (!pcConnected()) {
+      status(t(S.settings.pcLink ? 'scan.pcOffline' : 'scan.needPc'), 'warn');
+      if (S.settings.pcLink) linkToPc(S.settings.pcLink);
+      return;
+    }
+    if (navigator.vibrate) navigator.vibrate(60);
+    S.scan.count++;
+    const h = document.querySelector('.sheet-head h2');
+    if (h) h.textContent = scanTitle(S.scan.count);
+    status(t('scan.sending'));
+    const ok = await sendFrameToPc(frame, boxes, q);
+    if (alive()) status(t(ok ? 'scan.sent' : 'scan.sendFail', { n: S.scan.count }), ok ? '' : 'err');
+  };
   await startScanner(document.getElementById('scan-video'), {
     fresh,
     stillWanted: alive,
     onRksv: (q, frame) => {
       if (!alive()) return;
       const key = `${q.kassenId}|${q.belegNr}`;
+      if (pcMode()) {
+        if (sent.has(key)) {
+          if (lastDup !== key) { lastDup = key; status(t('scan.sentAlready'), 'warn'); }
+          return;
+        }
+        sent.add(key);
+        send(frame, [], q);
+        return;
+      }
       if (S.scan && S.scan.skipKey === key) return;
       if (S.entries.some((x) => x.rksvKey === key)) {
         if (lastDup !== key) { lastDup = key; status(t('scan.dup', { nr: q.belegNr }), 'warn'); if (navigator.vibrate) navigator.vibrate([40, 60, 40]); }
@@ -1052,7 +1188,14 @@ async function openScanner(count = 0, fresh = false) {
       if (navigator.vibrate) navigator.vibrate(80);
       askOrOpenRksv(q, frame);
     },
-    onOther: () => {
+    onOther: (texts) => {
+      // QR-Code der App am PC: koppeln.
+      const pair = (texts || []).find((x) => x.startsWith(PAIR_PREFIX));
+      if (pair) {
+        const id = pair.slice(PAIR_PREFIX.length).trim();
+        if (id && id !== S.settings.pcLink) linkToPc(id);
+        return;
+      }
       if (!holding && Date.now() - lastOther > 2500) { lastOther = Date.now(); status(t('scan.other'), 'warn'); }
     },
     onBoxes: (boxes, progress) => {
@@ -1065,6 +1208,8 @@ async function openScanner(count = 0, fresh = false) {
     // Bon liegt ruhig im Bild, aber ohne lesbaren Code: Foto übernehmen und direkt zum Zuschneiden.
     onReceipt: (frame, boxes) => {
       if (!alive()) return;
+      // PC-Modus: Foto samt erkannten Rahmen senden und gleich weiterscannen.
+      if (pcMode()) { send(frame, boxes, null); return; }
       stopScanner();
       if (navigator.vibrate) navigator.vibrate(60);
       frame.toBlob((blob) => {
@@ -1171,6 +1316,236 @@ function openFromRksv(q, frame, prof, how) {
   m.ocr = how === 'known' ? { status: 'scan', known: prof.name }
     : how === 'chain' ? { status: 'scan', chain: prof.name } : { status: 'scan', saved: prof.name };
   renderModal();
+}
+
+// ---------- Handy -> PC ----------
+
+// Handy: mit dem PC koppeln bzw. neu verbinden. Die Kennung bleibt gespeichert.
+async function linkToPc(id) {
+  if (S.link === 'connecting') return;
+  if (S.settings.pcLink !== id) { S.settings.pcLink = id; await saveSettings(); }
+  S.link = 'connecting';
+  refreshScanUi();
+  const ok = await connectPc(id, (st) => { S.link = st === 'connected' ? 'connected' : 'off'; refreshScanUi(); });
+  S.link = ok ? 'connected' : 'off';
+  refreshScanUi(ok ? 'scan.paired' : 'scan.pcOffline');
+  if (ok && navigator.vibrate) navigator.vibrate([30, 40, 30]);
+}
+
+function refreshScanUi(msgKey) {
+  if (!S.modal || S.modal.type !== 'scan') { if (!S.modal) render(); return; }
+  const h = document.querySelector('.sheet-head h2');
+  if (h) h.textContent = scanTitle(S.scan ? S.scan.count : 0);
+  const el = document.getElementById('scan-status');
+  if (el) {
+    el.textContent = t(msgKey || (S.link === 'connected' ? 'scan.paired' : 'scan.pcConnecting'));
+    el.className = `scan-status ${msgKey === 'scan.pcOffline' ? 'warn' : ''}`;
+  }
+  // Knopf "PC trennen" erscheint erst nach der Kopplung.
+  const foot = document.querySelector('.sheet-foot');
+  if (foot && S.settings.pcLink && !foot.querySelector('[data-act="pc-unpair"]')) {
+    foot.insertAdjacentHTML('afterbegin', `<button class="btn" data-act="pc-unpair">${t('scan.unpair')}</button>`);
+    foot.querySelector('[data-act="scan-photo"]')?.remove();
+  }
+}
+
+async function unpairPc() {
+  disconnectPc();
+  S.link = 'off';
+  S.settings.pcLink = null;
+  await saveSettings();
+  if (S.modal && S.modal.type === 'scan') { S.modal = null; S.scan = null; }
+  render();
+  showToast(t('pc.unpaired'), 'ok');
+}
+
+// Kamerabild verkleinert (höchstens 2400 Pixel) als JPEG an den PC schicken.
+async function sendFrameToPc(frame, boxes, q) {
+  let c = frame;
+  const sc = Math.min(1, 2400 / Math.max(frame.width, frame.height));
+  if (sc < 1) {
+    c = document.createElement('canvas');
+    c.width = Math.round(frame.width * sc);
+    c.height = Math.round(frame.height * sc);
+    c.getContext('2d').drawImage(frame, 0, 0, c.width, c.height);
+  }
+  const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.88));
+  if (!blob) return false;
+  return sendToPc({ type: 'receipt', id: uid(), jpeg: await blob.arrayBuffer(), boxes: boxes || [], rksv: q || null });
+}
+
+// PC: Empfang starten (feste Kennung, damit das Handy gekoppelt bleibt).
+async function startPcReceive() {
+  if (!S.settings.pcId) { S.settings.pcId = newPcId(); await saveSettings(); }
+  if (!S.pcStatus || S.pcStatus === 'error') S.pcStatus = 'starting';
+  try {
+    await hostPc(S.settings.pcId, {
+      onStatus: (st) => { S.pcStatus = st; refreshPc(); },
+      onReceipt: onPcReceipt,
+    });
+  } catch (e) {
+    console.warn('PC-Empfang', e);
+    S.pcStatus = 'error';
+    refreshPc();
+  }
+}
+
+function refreshPc() {
+  if (S.modal && S.modal.type === 'pcRecv') renderModal();
+  else if (!S.modal && S.biz && S.view === 'home') render();
+}
+
+async function onPcReceipt(msg, reply) {
+  if (!S.inbox.some((x) => x.id === msg.id)) {
+    const item = { id: String(msg.id), blob: new Blob([msg.jpeg], { type: 'image/jpeg' }), boxes: msg.boxes || [], rksv: msg.rksv || null, at: Date.now() };
+    await db.put('inbox', item);
+    S.inbox.push(item);
+    showToast(t('pc.received', { n: S.inbox.length }), 'ok');
+    refreshPc();
+  }
+  reply({ type: 'ack', id: msg.id });
+}
+
+const inboxUrls = new Map();
+function inboxUrl(item) {
+  if (!inboxUrls.has(item.id)) inboxUrls.set(item.id, URL.createObjectURL(item.blob));
+  return inboxUrls.get(item.id);
+}
+
+async function dropInbox(ids) {
+  for (const id of ids) {
+    await db.del('inbox', id);
+    if (inboxUrls.has(id)) { URL.revokeObjectURL(inboxUrls.get(id)); inboxUrls.delete(id); }
+  }
+  S.inbox = S.inbox.filter((x) => !ids.includes(x.id));
+}
+
+async function openPcRecv() {
+  S.modal = { type: 'pcRecv', token: uid() };
+  render();
+  startPcReceive();
+  if (!S.pcQr) {
+    try { S.pcQr = await qrSvg(PAIR_PREFIX + S.settings.pcId); } catch (e) { console.warn('QR', e); }
+    if (S.modal && S.modal.type === 'pcRecv') renderModal();
+  }
+}
+
+// ---------- PC: alle empfangenen Fotos auslesen und in einer Tabelle prüfen ----------
+
+async function readInbox() {
+  const items = [...S.inbox];
+  if (!items.length) return;
+  const token = uid();
+  S.modal = { type: 'review', token, busy: true, done: 0, total: items.length, rows: [] };
+  render();
+  const alive = () => S.modal && S.modal.token === token;
+  for (const item of items) {
+    if (!alive()) return;
+    try {
+      S.modal.rows.push(...await draftsFromItem(item));
+    } catch (e) {
+      console.warn('Auslesen', e);
+      S.modal.rows.push({ id: uid(), itemId: item.id, thumb: inboxUrl(item), date: todayISO(), party: '', desc: S.biz.categories[0] || '', ref: '', amount: '', on: false, error: true });
+    }
+    if (!alive()) return;
+    S.modal.done++;
+    renderModal();
+  }
+  markDupes(S.modal.rows);
+  // Unvollständige Zeilen gleich rot markieren, damit sie beim Durchsehen auffallen.
+  S.modal.rows.forEach((r) => { if (r.on && (!r.party.trim() || !(parseAmount(r.amount) > 0))) r.invalid = true; });
+  S.modal.busy = false;
+  renderModal();
+}
+
+// Ein Foto kann mehrere Bons enthalten (Rahmen vom Handy oder neu gesucht): je Bon eine Zeile.
+async function draftsFromItem(item) {
+  const src = await createImageBitmap(item.blob);
+  let boxes = item.boxes && item.boxes.length ? item.boxes : detectReceipts(src);
+  const whole = !boxes.length;
+  if (whole) boxes = [{ x: 0, y: 0, w: 1, h: 1 }];
+  const rows = [];
+  for (const box of boxes) {
+    const img = await prepareImage(whole ? item.blob : await cropToBlob(src, box));
+    let q = boxes.length === 1 && item.rksv ? item.rksv : null;
+    if (!q) q = await scanRksv(img.src).catch(() => null);
+    let res = null;
+    if (S.settings.apiKey) {
+      try {
+        const list = await ocr.recognizeWithClaude({ apiKey: S.settings.apiKey, model: S.settings.model, base64: img.base64, biz: S.biz });
+        res = list[0] || null;
+      } catch (e) { console.warn('Claude', e); }
+    }
+    if (!res) res = await ocr.recognizeOffline(img.ocrCanvas, S.biz, null, img.ocrCanvasAlt);
+    const m = { data: { date: todayISO(), party: '', desc: S.biz.categories[0] || '', ref: '', amount: '' }, touched: new Set() };
+    let needSupplier = false;
+    let chains = [];
+    if (q) {
+      mergeRksv(res, q);
+      // Wie beim Scan am Handy: Lieferant aus Kasse/Unternehmen oder der Kettenliste, sonst einmal von Hand.
+      const prof = kassenProfile(q);
+      const chain = prof ? null : chainByRksv(S.biz, q.cert);
+      const known = prof || (chain && chain.name ? chain : null);
+      if (known) {
+        m.data.party = known.name;
+        if (known.cat && S.biz.categories.includes(known.cat)) { m.data.desc = known.cat; m.touched.add('desc'); }
+      } else {
+        needSupplier = true;
+        chains = (chain && chain.chains) || [];
+      }
+      m.touched.add('party');
+    }
+    applyRecognition(m, res);
+    rows.push({
+      id: uid(), itemId: item.id, thumb: img.thumb, ...m.data, on: true, rksv: !!q, needSupplier, chains,
+      ocrText: m.ocrText, ocrSupplier: m.ocrSupplier, rksvKey: m.rksvKey, kassenId: m.kassenId, rksvCert: q ? q.cert || '' : '',
+    });
+  }
+  return rows;
+}
+
+// Schon erfasste Bons (gleicher RKSV-Code oder gleiche Buchung) markieren und nicht vorausgewählt lassen.
+function markDupes(rows) {
+  const seen = new Set();
+  for (const r of rows) {
+    const amount = parseAmount(r.amount);
+    const dup = (r.rksvKey && (seen.has(r.rksvKey) || S.entries.some((x) => x.rksvKey === r.rksvKey)))
+      || S.entries.some((x) => x.kind === 'receipt' && x.date === r.date && x.amount === amount && normKey(x.party) === normKey(r.party));
+    if (r.rksvKey) seen.add(r.rksvKey);
+    if (dup) { r.dup = true; r.on = false; }
+  }
+}
+
+async function saveReview() {
+  syncModal();
+  const m = S.modal;
+  if (!m || m.type !== 'review' || m.busy) return;
+  const rows = m.rows.filter((r) => r.on);
+  if (!rows.length) { showToast(t('rev.none'), 'err'); return; }
+  const bad = rows.filter((r) => !r.date || !r.party.trim() || !(parseAmount(r.amount) > 0));
+  if (bad.length) {
+    m.rows.forEach((r) => { r.invalid = bad.includes(r); });
+    renderModal();
+    showToast(t('rev.invalid'), 'err');
+    return;
+  }
+  const base = Date.now();
+  const entries = rows.map((r, i) => ({
+    id: uid(), bizId: S.biz.id, kind: 'receipt', date: r.date, amount: parseAmount(r.amount), created: base + i,
+    party: r.party.trim(), desc: r.desc, ref: (r.ref || '').trim(), dir: 'out', ...(r.rksvKey ? { rksvKey: r.rksvKey } : {}),
+  }));
+  await db.putMany('entries', entries);
+  S.entries = [...S.entries, ...entries];
+  rows.forEach((r, i) => learnSupplier(entries[i], r));
+  await saveBiz();
+  // Alle in diesem Durchgang ausgelesenen Fotos aus dem Eingang nehmen (auch abgewählte).
+  await dropInbox([...new Set(m.rows.map((r) => r.itemId))]);
+  db.requestPersistence();
+  markChanged();
+  S.month = entries[entries.length - 1].date.slice(0, 7);
+  S.modal = null;
+  render();
+  showToast(t('rev.saved', { n: entries.length }), 'ok');
 }
 
 async function deleteEntry() {
@@ -1332,6 +1707,21 @@ document.addEventListener('click', async (ev) => {
     case 'entry-save': saveEntry(); break;
     case 'sup-ask-ok': confirmSupplierAsk(); break;
     case 'sup-ask-pick': confirmSupplierAsk(arg); break;
+    case 'pc-receive': openPcRecv(); break;
+    case 'pc-unpair': unpairPc(); break;
+    case 'inbox-read': readInbox(); break;
+    case 'inbox-del': await dropInbox([arg]); refreshPc(); break;
+    case 'rev-save': saveReview(); break;
+    case 'rev-zoom': {
+      const m = S.modal;
+      if (!m || m.type !== 'review' || !m.rows[Number(arg)]) break;
+      syncModal();
+      m.rows[Number(arg)].zoom = !m.rows[Number(arg)].zoom;
+      renderModal();
+      break;
+    }
+    case 'camera-only': S.settings.cameraOnly = true; await saveSettings(); render(); break;
+    case 'camera-back': S.settings.cameraOnly = false; await saveSettings(); render(); break;
     case 'crop-use': useCrop(false); break;
     case 'crop-pick': {
       const m = S.modal;
@@ -1551,6 +1941,15 @@ document.addEventListener('input', (ev) => {
 
 document.addEventListener('change', async (ev) => {
   const el = ev.target;
+  // Prüftabelle: Zeile an- oder abwählen, Anzahl im Knopf mitführen.
+  if (el.dataset && el.dataset.r === 'on' && S.modal && S.modal.type === 'review') {
+    syncModal();
+    el.closest('.rev-row')?.classList.toggle('off', !el.checked);
+    const n = S.modal.rows.filter((r) => r.on).length;
+    const btn = document.getElementById('rev-save');
+    if (btn) { btn.disabled = !n; btn.querySelector('span').textContent = t('rev.save', { n }); }
+    return;
+  }
   if (el.id === 'in-camera' || el.id === 'in-gallery') {
     addFiles(el.files);
     el.value = '';
@@ -1625,7 +2024,10 @@ async function init() {
   S.businesses = (await db.getAll('businesses')).sort((a, b) => a.created - b.created);
   const active = S.businesses.find((b) => b.id === S.settings.activeBiz) || S.businesses[0];
   if (active) await selectBiz(active.id);
+  S.inbox = (await db.getAll('inbox')).sort((a, b) => a.at - b.at);
   render();
+  // PC: war schon einmal ein Handy gekoppelt, gleich empfangsbereit sein (auch ohne das Fenster zu öffnen).
+  if (S.settings.pcId && S.businesses.length && isDesktop()) startPcReceive();
   if ('serviceWorker' in navigator && location.hostname !== 'localhost') {
     navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('Service Worker', e));
   }

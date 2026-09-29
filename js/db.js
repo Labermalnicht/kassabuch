@@ -1,20 +1,28 @@
 // Lokale Datenhaltung in IndexedDB. Alles bleibt auf dem Gerät.
 const DB_NAME = 'kassabuch';
-const DB_VERSION = 1;
+// Version 2: Eingang (inbox) für Belegfotos, die das Handy an den PC schickt.
+const DB_VERSION = 2;
 let dbPromise = null;
 
 function open() {
   if (!dbPromise) {
     dbPromise = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
+      req.onupgradeneeded = (ev) => {
         const d = req.result;
-        d.createObjectStore('businesses', { keyPath: 'id' });
-        const entries = d.createObjectStore('entries', { keyPath: 'id' });
-        entries.createIndex('biz', 'bizId');
-        d.createObjectStore('meta', { keyPath: 'key' });
+        if (ev.oldVersion < 1) {
+          d.createObjectStore('businesses', { keyPath: 'id' });
+          const entries = d.createObjectStore('entries', { keyPath: 'id' });
+          entries.createIndex('biz', 'bizId');
+          d.createObjectStore('meta', { keyPath: 'key' });
+        }
+        if (ev.oldVersion < 2) d.createObjectStore('inbox', { keyPath: 'id' });
       };
-      req.onsuccess = () => resolve(req.result);
+      req.onsuccess = () => {
+        // Öffnet ein anderer Tab eine neuere Version, diese Verbindung freigeben.
+        req.result.onversionchange = () => { req.result.close(); dbPromise = null; };
+        resolve(req.result);
+      };
       req.onerror = () => reject(req.error);
     });
   }

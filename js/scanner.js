@@ -201,7 +201,7 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
         onRksv(q, grabFrame());
         return;
       }
-      if (texts.length && onOther) onOther();
+      if (texts.length && onOther) onOther(texts);
       if (onReceipt && Date.now() - lastDetect >= DETECT_EVERY) {
         lastDetect = Date.now();
         const boxes = detectStep(onBoxes);

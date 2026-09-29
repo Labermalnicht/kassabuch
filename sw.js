@@ -1,5 +1,5 @@
 // Offline-Fähigkeit: Die App-Dateien werden zwischengespeichert und im Hintergrund aktualisiert.
-const CACHE = 'kassabuch-v23';
+const CACHE = 'kassabuch-v24';
 const FILES = [
   './',
   './index.html',
@@ -11,6 +11,7 @@ const FILES = [
   './js/i18n.js',
   './js/image.js',
   './js/ledger.js',
+  './js/link.js',
   './js/ocr.js',
   './js/rksv.js',
   './js/scanner.js',
@@ -44,7 +45,7 @@ self.addEventListener('activate', (event) => {
 // Fremde Adressen (Claude-API, Texterkennung) laufen direkt über das Netz.
 // Texterkennung und Excel-Bibliothek vom CDN: einmal laden, danach aus dem Zwischenspeicher (versionierte Adressen).
 const CDN_CACHE = 'kassabuch-cdn-v1';
-const isCdnAsset = (url) => url.hostname === 'cdn.jsdelivr.net' && /tesseract|exceljs|jsqr/.test(url.pathname);
+const isCdnAsset = (url) => url.hostname === 'cdn.jsdelivr.net' && /tesseract|exceljs|jsqr|peerjs|qrcode-generator/.test(url.pathname);
 
 self.addEventListener('fetch', (event) => {
   const req = event.request;
