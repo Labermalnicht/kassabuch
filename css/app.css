@@ -369,3 +369,5 @@ input[type="date"] { display: block; }
 .tag.warn { color: var(--warn-ink); background: var(--warn-bg, #fff4dc); }
 .tag.err { color: var(--err-ink); background: var(--err-bg, #fdecec); }
 @media (max-width: 900px) { .rev-fields { grid-template-columns: 1fr 1fr; } }
+
+.date-hint { display: flex; align-items: center; gap: 10px; margin: -4px 0 12px; }

@@ -32,6 +32,7 @@ const S = {
   queueTotal: 0,
   queueDone: 0,
   scan: null, // laufende Scan-Runde { count }
+  lastDate: null, // zuletzt verwendetes Buchungsdatum { date, at }
   busy: false,
   inbox: [], // PC: vom Handy empfangene Belegfotos { id, blob, boxes, rksv, at }
   pcStatus: '', // PC: Empfangsbereitschaft
@@ -632,7 +633,10 @@ function reviewRow(r, i) {
 }
 
 const field = (label, inner, hint = '') => `<label class="field"><span class="lbl">${label}</span>${inner}${hint ? `<span class="hint">${hint}</span>` : ''}</label>`;
-const inDate = (d) => field(t('f.date'), `<input type="date" data-f="date" value="${esc(d.date)}" required>`);
+// Steht noch das zuletzt verwendete (nicht das heutige) Datum im Feld, darauf hinweisen und "Heute" anbieten.
+const inDate = (d) => field(t('f.date'), `<input type="date" data-f="date" value="${esc(d.date)}" required>`)
+  + (S.modal && S.modal.lastDate && S.modal.lastDate === d.date && d.date !== todayISO()
+    ? `<p class="hint date-hint">${t(S.modal.nextDay ? 'hint.nextDay' : 'hint.lastDate')} <button type="button" class="btn small" data-act="date-today">${t('today')}</button></p>` : '');
 const inMoney = (d, label = t('f.amount'), key = 'amount') => field(label, `<div class="money"><input type="text" inputmode="decimal" data-f="${key}" value="${esc(d[key])}" placeholder="0,00" autocomplete="off"><span>€</span></div>`);
 const inText = (d, key, label, attrs = '') => field(label, `<input type="text" data-f="${key}" value="${esc(d[key])}" autocomplete="off" ${attrs}>`);
 
@@ -793,12 +797,36 @@ function syncModal() {
   }
 }
 
+// Datum für eine neue, von Hand eingetragene Buchung: das zuletzt verwendete, damit man beim Nachtragen mehrerer
+// Tage nicht jedes Mal zurückblättern muss. Nach einer Stunde ohne Eintrag gilt wieder heute.
+// Tageslosung: gibt es für den Tag schon eine, gleich der nächste Tag ohne Tageslosung.
+const LAST_DATE_MS = 60 * 60 * 1000;
+function defaultDate(kind) {
+  const today = todayISO();
+  if (kind === 'receipt' || !S.lastDate || Date.now() - S.lastDate.at > LAST_DATE_MS) return today;
+  let d = S.lastDate.date;
+  if (kind === 'takings') {
+    const taken = new Set(S.entries.filter((x) => x.kind === 'takings').map((x) => x.date));
+    while (taken.has(d) && d < today) {
+      const n = new Date(`${d}T12:00:00`);
+      n.setDate(n.getDate() + 1);
+      d = `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+    }
+  }
+  return d > today ? today : d;
+}
+
 function openEntry(kind, preset = {}) {
-  const base = { date: todayISO(), party: '', desc: '', ref: '', amount: '', dir: 'out', sub: '', parts: [''] };
+  const date = preset.date || defaultDate(kind);
+  const base = { date, party: '', desc: '', ref: '', amount: '', dir: 'out', sub: '', parts: [''] };
   if (kind === 'receipt') base.desc = S.biz.categories[0] || '';
   if (kind === 'cashIn') { base.sub = CASH_IN[0].id; base.desc = CASH_IN[0].desc; }
   if (kind === 'cashOut') { base.sub = CASH_OUT[0].id; base.desc = CASH_OUT[0].desc; }
   S.modal = { type: 'entry', kind, data: { ...base, ...preset }, touched: new Set(), token: uid() };
+  if (!preset.date && date !== todayISO()) {
+    S.modal.lastDate = date;
+    S.modal.nextDay = !!S.lastDate && date !== S.lastDate.date;
+  }
   render();
   focusFirst();
 }
@@ -1153,6 +1181,8 @@ async function saveEntry() {
   }
   db.requestPersistence();
   markChanged();
+  // Datum für die nächste von Hand eingetragene Buchung merken (Belege bringen ihr Datum selbst mit).
+  if (!m.editId && kind !== 'receipt') S.lastDate = { date: e.date, at: Date.now() };
   S.month = e.date.slice(0, 7);
   S.modal = null;
   render();
@@ -1759,6 +1789,9 @@ document.addEventListener('click', async (ev) => {
       }
       break;
     case 'entry-save': saveEntry(); break;
+    case 'date-today':
+      if (S.modal && S.modal.type === 'entry') { syncModal(); S.modal.data.date = todayISO(); S.modal.lastDate = null; renderModal(); }
+      break;
     case 'sup-ask-ok': confirmSupplierAsk(); break;
     case 'sup-ask-pick': confirmSupplierAsk(arg); break;
     case 'pc-receive': openPcRecv(); break;
