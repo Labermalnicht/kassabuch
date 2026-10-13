@@ -261,9 +261,11 @@ function viewHome() {
 
   const act = (a, ic, label, cls = '') => `<button class="act ${cls}" data-act="${a}">${icon(ic)}<span>${label}</span></button>`;
   const actions = [
-    // Am PC steht das Empfangen vom Handy vorne, am Handy das Scannen.
-    isDesktop() ? act('pc-receive', 'qr', t('act.pcReceive'), 'primary wide') : act('qr-scan', 'camera', t('act.scan'), 'primary wide'),
-    act('receipt-camera', 'image', t('act.camera')),
+    // Am PC steht das Empfangen vom Handy vorne. Am Handy: Beleg fotografieren, Ergebnis prüfen, speichern.
+    // Der Scanner darunter liest QR-Codes sofort aus bzw. schickt die Bons an einen gekoppelten PC.
+    ...(isDesktop()
+      ? [act('pc-receive', 'qr', t('act.pcReceive'), 'primary wide'), act('receipt-camera', 'camera', t('act.camera'))]
+      : [act('receipt-camera', 'camera', t('act.camera'), 'primary wide'), act('qr-scan', 'qr', t(S.settings.pcLink ? 'act.sendPc' : 'act.qr'), 'scan wide')]),
     act('receipt-gallery', 'image', t('act.gallery')),
     act('new:takings', 'cash', t('act.takings')),
     act('new:tips', 'coins', t('act.tips')),
@@ -874,7 +876,7 @@ async function openCrop(file, index = 0) {
     S.modal.src = d.src;
     S.modal.preview = d.preview;
     // Belege automatisch suchen und den Rahmen auf den (nächsten) gefundenen Beleg setzen.
-    try { S.modal.found = file.found || detectReceipts(d.src); } catch (e) { console.warn('Belegsuche', e); S.modal.found = []; }
+    try { S.modal.found = detectReceipts(d.src); } catch (e) { console.warn('Belegsuche', e); S.modal.found = []; }
     const f = S.modal.found;
     if (f.length) {
       S.modal.index = Math.min(index, f.length - 1);
@@ -1210,6 +1212,8 @@ async function openScanner(count = 0, fresh = false) {
   await startScanner(document.getElementById('scan-video'), {
     fresh,
     stillWanted: alive,
+    // Bons automatisch aufnehmen nur für den PC; am Handy selbst wird ein Beleg von Hand fotografiert.
+    wantReceipts: pcMode,
     onRksv: (q, frame) => {
       if (!alive()) return;
       const key = `${q.kassenId}|${q.belegNr}`;
@@ -1245,26 +1249,12 @@ async function openScanner(count = 0, fresh = false) {
       if (!alive()) return;
       drawScanBoxes(boxes, progress);
       if (progress > 0) status(t('scan.hold'));
-      else if (holding) status(t('scan.hint'));
+      else if (holding) status(t(pcConnected() ? 'scan.paired' : 'scan.hint'));
       holding = progress > 0;
     },
-    // Bon liegt ruhig im Bild, aber ohne lesbaren Code: Foto übernehmen und direkt zum Zuschneiden.
+    // PC-Modus: Bon liegt ruhig im Bild, Foto samt erkannten Rahmen senden und gleich weiterscannen.
     onReceipt: (frame, boxes) => {
-      if (!alive()) return;
-      // PC-Modus: Foto samt erkannten Rahmen senden und gleich weiterscannen.
-      if (pcMode()) { send(frame, boxes, null); return; }
-      stopScanner();
-      if (navigator.vibrate) navigator.vibrate(60);
-      frame.toBlob((blob) => {
-        if (!alive() || !blob) return;
-        // Die im Live-Bild ruhig erkannten Rahmen gelten auch im Zuschneiden (keine neue, evtl. abweichende Suche).
-        blob.found = boxes;
-        S.queue = [];
-        S.queueTotal = 1;
-        S.queueDone = 0;
-        S.queue.push(blob);
-        processNext();
-      }, 'image/jpeg', 0.92);
+      if (alive() && pcMode()) send(frame, boxes, null);
     },
     onError: (err) => { console.warn('Kamera', err); if (alive()) status(t('scan.noCamera'), 'err'); },
   });

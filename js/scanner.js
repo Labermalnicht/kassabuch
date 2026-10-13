@@ -144,8 +144,9 @@ function jsqrTick(jsQR, onText) {
  * onOther() bei anderen QR-Codes (z. B. Feedback-Links), onError(fehler) wenn die Kamera nicht verfügbar ist.
  * onReceipt(bild, bons) wird aufgerufen, wenn Bons ohne lesbaren Code ruhig im Bild liegen; onBoxes(bons, fortschritt)
  * nach jeder Bonsuche für die Anzeige. fresh: neue Scan-Runde, ein zuvor übernommener Bon zählt wieder.
+ * wantReceipts(): nur wenn das true liefert, wird überhaupt nach Bons gesucht (sonst reiner QR-Scanner).
  */
-export async function startScanner(videoEl, { onRksv, onOther, onError, stillWanted, onReceipt, onBoxes, fresh }) {
+export async function startScanner(videoEl, { onRksv, onOther, onError, stillWanted, onReceipt, onBoxes, fresh, wantReceipts }) {
   stopScanner();
   if (fresh) blocked = null;
   lastDetect = Date.now() + 600; // erste Bonsuche erst, wenn die Kamera scharf gestellt hat
@@ -181,6 +182,7 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
     try { jsQR = await loadQrLib(); } catch (e) { onError(e); stopScanner(); return; }
   }
 
+  const receipts = () => !!onReceipt && (!wantReceipts || wantReceipts());
   const tick = async () => {
     if (!stream || busy || !video || video.readyState < 2) return;
     busy = true;
@@ -197,12 +199,12 @@ export async function startScanner(videoEl, { onRksv, onOther, onError, stillWan
       }
       if (q) {
         // Dieser Bon ist über seinen Code erledigt (oder schon erfasst): nicht zusätzlich als Foto übernehmen.
-        if (onReceipt) { detectStep(null); blocked = (track && track.box) || blocked; track = null; }
+        if (receipts()) { detectStep(null); blocked = (track && track.box) || blocked; track = null; }
         onRksv(q, grabFrame());
         return;
       }
       if (texts.length && onOther) onOther(texts);
-      if (onReceipt && Date.now() - lastDetect >= DETECT_EVERY) {
+      if (receipts() && Date.now() - lastDetect >= DETECT_EVERY) {
         lastDetect = Date.now();
         const boxes = detectStep(onBoxes);
         if (boxes) {
